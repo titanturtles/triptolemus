@@ -36,8 +36,24 @@ if [ ! -x "$EXE" ]; then
   elif [ -f "$HERE/pt_agent.py" ]; then
     echo "[*] building pt_agent from source (first run can take a minute)..."
     PY="$(command -v python3 || command -v python || true)"
-    [ -n "$PY" ] || { echo "ERROR: Python 3 not found (install: sudo apt install python3 python3-tk python3-pip)"; exit 1; }
-    "$PY" -m pip install --user --quiet --upgrade pyinstaller cryptography
+    [ -n "$PY" ] || { echo "ERROR: Python 3 not found. Install: sudo apt install -y python3 python3-tk python3-pip"; exit 1; }
+    if ! "$PY" -m pip --version >/dev/null 2>&1; then
+      "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+    if ! "$PY" -m pip --version >/dev/null 2>&1; then
+      echo "ERROR: Python pip is not installed."
+      echo "  Fix (as root):  apt update && apt install -y python3-pip python3-tk"
+      echo "  then re-run:    ./install_student.sh"
+      echo "  Or skip building: put a prebuilt 'pt_agent' binary in $HERE and re-run."
+      exit 1
+    fi
+    if ! "$PY" -c 'import tkinter' >/dev/null 2>&1; then
+      echo "ERROR: Python tkinter is missing (needed for the GUI)."
+      echo "  Fix (as root):  apt install -y python3-tk   then re-run ./install_student.sh"
+      exit 1
+    fi
+    "$PY" -m pip install --quiet --upgrade pyinstaller cryptography \
+      || "$PY" -m pip install --user --quiet --upgrade pyinstaller cryptography
     "$PY" -m PyInstaller --onefile --name pt_agent --noconfirm \
       --distpath "$HERE/dist" --workpath "$HERE/build" --specpath "$HERE" "$HERE/pt_agent.py"
     cp "$HERE/dist/pt_agent" "$EXE"
