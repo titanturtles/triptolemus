@@ -18,11 +18,20 @@ keeps it.
    - **Quit Packet Tracer normally** (File → Exit) so it saves the registration.
    - This is the *only* time first-time setup is done. It is stored in Packet Tracer's
      config and survives reboots and clones.
-4. **Build + shortcut + auto-start, in one step:** double-click **`install_student.bat`**.
-   It finds `pt_agent.exe` (or copies it from `dist\`, or **builds it from `pt_agent.py`**,
-   installing PyInstaller automatically), then creates a Desktop shortcut and a
-   Startup-folder shortcut so the app opens at login. (First build can take a minute.
-   Use `-ForceBuild` to rebuild, `-Remove` to delete the shortcuts.)
+4. **Build + config + shortcut + auto-start, in one step.** Open a terminal in the folder
+   and run (fill in the class token from the manager's **Student bootstrap...**):
+   ```
+   install_student.bat -Levelsvc "https://scoreboard.titanturtles.xyz/levels" -ClassToken "<CLASS TOKEN>"
+   ```
+   This writes `pt_agent.conf.json` (so the app loads every competition from the server —
+   students never touch a config file), builds `pt_agent.exe` if needed (from `dist\` or
+   `pt_agent.py`, installing PyInstaller automatically), and creates the Desktop + Startup
+   shortcuts so the app opens at login.
+   - You only need the `-Levelsvc/-ClassToken` the first time (or to change servers).
+     After that, plain `install_student.bat` just rebuilds/refreshes shortcuts.
+   - `-ForceBuild` rebuilds the exe; `-Remove` deletes the shortcuts.
+   - Get the class token: in the manager click **Student bootstrap...**, open the saved
+     `pt_agent.conf.json`, and copy its `class_token` value.
 5. **Start on boot:** enable **automatic logon** for the kiosk Windows user
    (e.g. `netplwiz` → uncheck "Users must enter a user name and password", or set
    `AutoAdminLogon`), so login — and the app — happen without a password at boot.

@@ -14,7 +14,7 @@
 # the image and every clone keeps it.  Switches:  -Remove  (delete shortcuts),
 # -ForceBuild  (rebuild the exe even if one exists).
 
-param([switch]$Remove, [switch]$ForceBuild)
+param([switch]$Remove, [switch]$ForceBuild, [string]$Levelsvc, [string]$ClassToken)
 $ErrorActionPreference = "Stop"
 
 $here    = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -27,6 +27,18 @@ if ($Remove) {
     foreach ($t in $targets) { if (Test-Path $t) { Remove-Item $t -Force; Write-Host "removed $t" } }
     Write-Host "Done (Packet Tracer registration was not touched)."
     return
+}
+
+# Write the student bootstrap config (server URL + class token) so students never touch
+# a config file: the app then loads every competition from the server on open/Reload.
+# Pass -Levelsvc and -ClassToken (from the manager's "Student bootstrap..."). This
+# overwrites any stale/legacy config left in the folder.
+if ($Levelsvc -and $ClassToken) {
+    $conf = [ordered]@{ levelsvc = $Levelsvc; class_token = $ClassToken; interval = 10; auto_launch = $true }
+    ($conf | ConvertTo-Json) | Set-Content -Path (Join-Path $here "pt_agent.conf.json") -Encoding ASCII
+    Write-Host "Wrote pt_agent.conf.json (server-served). Students just open the app."
+} elseif ($Levelsvc -or $ClassToken) {
+    Write-Error "Pass BOTH -Levelsvc and -ClassToken (or neither)."; exit 1
 }
 
 $exe  = Join-Path $here "pt_agent.exe"

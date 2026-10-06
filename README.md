@@ -88,8 +88,13 @@ Students need three things once per machine/VM: the `pt_agent` app, a small
    default, and the scoring keys from the server **on every open** — so when you add,
    hide, or change a competition on the server, students get it automatically (they click
    **Reload** or reopen). You do **not** re-hand-out files when competitions change.
-2. Build the student Windows VM once using **`WINDOWS_VM_SETUP.md`** (register the agent
-   in Packet Tracer once, run `install_student.bat` for the desktop + startup shortcut).
+2. Build the student Windows VM once using **`WINDOWS_VM_SETUP.md`**. The one-step installer
+   both writes that config and sets up the app, so **students never touch a config file** —
+   they just open the icon and every competition loads:
+   ```
+   install_student.bat -Levelsvc "https://scoreboard.titanturtles.xyz/levels" -ClassToken "<class token>"
+   ```
+   (class token = the `class_token` value inside the Student bootstrap file).
 
 (If you ever want a self-contained config with the keys baked in instead of the
 server-served flow, select a competition and use **Export agent config**.)
