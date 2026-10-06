@@ -1141,6 +1141,51 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// resetHandler erases a team's recorded scores + saved progress for a competition, so
+// the level gating resets to Level 1 (the student's "Start over"). Class-token gated
+// because it is destructive.
+func resetHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	c := snapshot()
+	tok := r.Header.Get("X-Class-Token")
+	if tok == "" {
+		tok = r.URL.Query().Get("token")
+	}
+	if c.ClassToken == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(c.ClassToken)) != 1 {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	cp := resolveComp(c, r.URL.Query().Get("comp"))
+	team := r.URL.Query().Get("team")
+	if cp == nil || team == "" {
+		http.Error(w, "comp and team required", 400)
+		return
+	}
+	images := make([]string, 0, len(cp.Levels))
+	for _, l := range cp.Levels {
+		images = append(images, l.Image)
+	}
+	var deleted int64
+	if len(images) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if res, err := scores.DeleteMany(ctx, bson.M{"team.id": team, "image.name": bson.M{"$in": images}}); err == nil {
+			deleted = res.DeletedCount
+		} else {
+			log.Printf("reset DeleteMany: %v", err)
+		}
+	}
+	for _, l := range cp.Levels {
+		os.Remove(filepath.Join(c.ProgressDir, cp.ID, fmt.Sprintf("%s_L%d.pka", filepath.Base(team), l.Level)))
+	}
+	log.Printf("reset comp=%s team=%s: deleted %d score(s) + progress", cp.ID, team, deleted)
+	writeJSON(w, map[string]interface{}{"status": "OK", "deleted": deleted})
+}
+
 // adminClassToken returns the shared student class token (generating one if needed).
 func adminClassToken(w http.ResponseWriter, r *http.Request) {
 	cors(w)
@@ -1229,6 +1274,7 @@ func main() {
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/progress", progressHandler)
 	http.HandleFunc("/enroll", enrollHandler)
+	http.HandleFunc("/reset", resetHandler)
 	http.HandleFunc("/admin/competitions", adminCompetitions)
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)

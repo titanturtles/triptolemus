@@ -365,6 +365,16 @@ class LevelsClient:
             f.write(data)
         return len(data)
 
+    def reset(self, team, comp, token):
+        """Erase this team's scores + progress for the competition (class-token gated)."""
+        q = {"team": team}
+        if comp:
+            q["comp"] = comp
+        req = urllib.request.Request(self.base + "/reset?" + urllib.parse.urlencode(q), data=b"", method="POST",
+                                     headers={"X-Class-Token": token or ""})
+        with urllib.request.urlopen(req, timeout=max(self.timeout, 30)) as r:
+            return r.getcode()
+
 
 # ---------------- OS helpers ----------------
 def close_pt():
@@ -692,6 +702,20 @@ class Competition:
         self._stop_loop()
         self.start(fresh=True)
 
+    def restart_all(self):
+        """Erase this team's scores + progress for the whole competition on the server, then
+        load Level 1 (gating resets because the recorded scores are gone)."""
+        self._stop_loop()
+        try:
+            self.levels.reset(self.team, self.comp, self.cfg.get("class_token"))
+            self.report("log", "Progress erased on the server. Restarting at Level 1.")
+        except Exception as e:
+            self.report("log", f"Could not reset progress: {e}")
+            self.report("error", "Could not reset your progress on the server:\n\n" + str(e))
+            self.report("state", "idle")
+            return
+        self.start(fresh=True)
+
     def checkpoint(self):
         """Save + upload the current work, but keep Packet Tracer open and keep scoring."""
         if not (self.client and self.current and self.current_path):
@@ -796,6 +820,7 @@ def resolve_enrollment(cfg):
         "remote": cfg.get("remote", ""), "levelsvc": cfg.get("levelsvc", ""),
         "pt_app_id": cfg.get("pt_app_id", ""), "pt_secret": cfg.get("pt_secret", ""),
         "interval": cfg.get("interval", 10), "auto_launch": cfg.get("auto_launch", True),
+        "class_token": cfg.get("class_token", ""),
     }
     if cfg.get("pt_command"):
         shared["pt_command"] = cfg["pt_command"]
@@ -978,14 +1003,15 @@ def run_gui(cfg, conf_dir):
         return comp["obj"]
 
     # enabled buttons per state: (start, resume, stop, checkpoint, start-over, finish)
-    BTN_STATES = {"idle":    (1, 0, 0, 0, 1, 0),
-                  "running": (0, 0, 1, 1, 1, 1),
-                  "paused":  (0, 1, 0, 0, 1, 1),
-                  "done":    (0, 0, 0, 0, 0, 0),
-                  "busy":    (0, 0, 0, 0, 0, 0)}
+    # (start, resume, stop, checkpoint, restart-level, start-over-L1, finish)
+    BTN_STATES = {"idle":    (1, 0, 0, 0, 0, 1, 0),
+                  "running": (0, 0, 1, 1, 1, 1, 1),
+                  "paused":  (0, 1, 0, 0, 1, 1, 1),
+                  "done":    (0, 0, 0, 0, 0, 0, 0),
+                  "busy":    (0, 0, 0, 0, 0, 0, 0)}
 
     def set_buttons(st):
-        for b, on in zip((btn_start, btn_resume, btn_stop, btn_checkpoint, btn_over, btn_finish),
+        for b, on in zip((btn_start, btn_resume, btn_stop, btn_checkpoint, btn_over, btn_startover, btn_finish),
                          BTN_STATES.get(st, BTN_STATES["idle"])):
             b.configure(state=("normal" if on else "disabled"))
         # lock the competition picker / reset once a competition is under way
@@ -1032,11 +1058,24 @@ def run_gui(cfg, conf_dir):
         c = ensure_comp()
         if not c:
             return
-        if not messagebox.askyesno("Start from beginning",
-                "This discards your progress on the current level and loads a clean copy. Continue?"):
+        if not messagebox.askyesno("Restart this level",
+                "Reload a clean copy of the CURRENT level (discards unsaved work on this level "
+                "only). This does NOT go back to Level 1. Continue?"):
             return
-        logln("Starting the level over with a clean copy…")
+        logln("Restarting the current level with a clean copy…")
         run_action(c.start_over, "Loading a clean copy…")
+
+    def do_restart_all():
+        c = ensure_comp()
+        if not c:
+            return
+        if not messagebox.askyesno("Start over (Level 1)",
+                "ERASE all your progress in this competition and go back to Level 1?\n\n"
+                "This deletes your recorded scores and saved work for this competition on the "
+                "server and cannot be undone. Continue?"):
+            return
+        logln("Erasing progress and restarting from Level 1…")
+        run_action(c.restart_all, "Resetting to Level 1…")
 
     def do_finish():
         c = comp["obj"]
@@ -1080,16 +1119,18 @@ def run_gui(cfg, conf_dir):
         btnbar.columnconfigure(col, weight=1)
     btn_start      = ttk.Button(btnbar, text="Start",                command=do_start)
     btn_resume     = ttk.Button(btnbar, text="Resume",               command=do_resume)
-    btn_checkpoint = ttk.Button(btnbar, text="Save & keep working",  command=do_checkpoint)
     btn_stop       = ttk.Button(btnbar, text="Stop (save & close)",  command=do_stop)
-    btn_over       = ttk.Button(btnbar, text="Start from beginning", command=do_over)
+    btn_checkpoint = ttk.Button(btnbar, text="Save & keep working",  command=do_checkpoint)
+    btn_over       = ttk.Button(btnbar, text="Restart this level",   command=do_over)
+    btn_startover  = ttk.Button(btnbar, text="Start over (Level 1)", command=do_restart_all)
     btn_finish     = ttk.Button(btnbar, text="Finish Competition",   command=do_finish)
     btn_start.grid(row=0, column=0, sticky="we", padx=3, pady=2)
     btn_resume.grid(row=0, column=1, sticky="we", padx=3, pady=2)
-    btn_checkpoint.grid(row=0, column=2, sticky="we", padx=3, pady=2)
-    btn_stop.grid(row=1, column=0, sticky="we", padx=3, pady=2)
+    btn_stop.grid(row=0, column=2, sticky="we", padx=3, pady=2)
+    btn_checkpoint.grid(row=1, column=0, sticky="we", padx=3, pady=2)
     btn_over.grid(row=1, column=1, sticky="we", padx=3, pady=2)
-    btn_finish.grid(row=1, column=2, sticky="we", padx=3, pady=2)
+    btn_startover.grid(row=1, column=2, sticky="we", padx=3, pady=2)
+    btn_finish.grid(row=2, column=0, sticky="we", padx=3, pady=2)
     set_buttons("idle")
 
     def select_comp(*_):
@@ -1204,8 +1245,8 @@ def run_gui(cfg, conf_dir):
             ww = root.winfo_width()
             print(f"[geo] window width={ww}")
             for nm, b in [("start", btn_start), ("resume", btn_resume), ("checkpoint", btn_checkpoint),
-                          ("stop", btn_stop), ("startover", btn_over), ("finish", btn_finish),
-                          ("reset", reset_btn), ("reload", reload_btn)]:
+                          ("stop", btn_stop), ("restartlevel", btn_over), ("startoverL1", btn_startover),
+                          ("finish", btn_finish), ("reset", reset_btn), ("reload", reload_btn)]:
                 x, w = b.winfo_rootx() - root.winfo_rootx(), b.winfo_width()
                 vis = "OK" if (x >= 0 and x + w <= ww and w > 1) else "CLIPPED"
                 print(f"[geo] {nm:10s} x={x:4d} w={w:4d} text='{b.cget('text')}' -> {vis}")
