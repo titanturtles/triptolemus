@@ -14,7 +14,14 @@
 # the image and every clone keeps it.  Switches:  -Remove  (delete shortcuts),
 # -ForceBuild  (rebuild the exe even if one exists).
 
-param([switch]$Remove, [switch]$ForceBuild, [string]$Levelsvc, [string]$ClassToken)
+param(
+  [switch]$Remove,
+  [switch]$ForceBuild,
+  # Server config baked in as defaults so plain install_student.bat produces a
+  # server-served VM (students only type a Team ID). Override for a different server.
+  [string]$Levelsvc   = "https://scoreboard.titanturtles.xyz/levels",
+  [string]$ClassToken = "0b90c526f93f638dd1fb1bd1b27e2c18a521c30daf8203a0"
+)
 $ErrorActionPreference = "Stop"
 
 $here    = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -29,17 +36,12 @@ if ($Remove) {
     return
 }
 
-# Write the student bootstrap config (server URL + class token) so students never touch
-# a config file: the app then loads every competition from the server on open/Reload.
-# Pass -Levelsvc and -ClassToken (from the manager's "Student bootstrap..."). This
-# overwrites any stale/legacy config left in the folder.
-if ($Levelsvc -and $ClassToken) {
-    $conf = [ordered]@{ levelsvc = $Levelsvc; class_token = $ClassToken; interval = 10; auto_launch = $true }
-    ($conf | ConvertTo-Json) | Set-Content -Path (Join-Path $here "pt_agent.conf.json") -Encoding ASCII
-    Write-Host "Wrote pt_agent.conf.json (server-served). Students just open the app."
-} elseif ($Levelsvc -or $ClassToken) {
-    Write-Error "Pass BOTH -Levelsvc and -ClassToken (or neither)."; exit 1
-}
+# Always (over)write the server bootstrap config so the app loads every competition
+# from the server on open/Reload. This overwrites any stale/legacy config in the folder.
+# The class token lives here, never typed by students -- they only enter a Team ID.
+$conf = [ordered]@{ levelsvc = $Levelsvc; class_token = $ClassToken; interval = 10; auto_launch = $true }
+($conf | ConvertTo-Json) | Set-Content -Path (Join-Path $here "pt_agent.conf.json") -Encoding ASCII
+Write-Host "Wrote pt_agent.conf.json (server-served). Students only open the app and enter a Team ID."
 
 $exe  = Join-Path $here "pt_agent.exe"
 $dist = Join-Path $here "dist\pt_agent.exe"

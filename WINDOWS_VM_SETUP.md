@@ -9,29 +9,23 @@ keeps it.
 1. **Install Cisco Packet Tracer** and sign in (NetAcad / Skills for All) so it's ready.
 2. Put the student folder somewhere permanent, e.g. `C:\CiscoComp\`, containing:
    - `pt_agent.py`  (source — the installer builds the exe), **or** a prebuilt `pt_agent.exe` / `dist\pt_agent.exe`
-   - `pt_agent.conf.json`  (the **Student bootstrap** file from the manager: server URL + class token)
    - `ptagent.pta`
-   - `install_student.ps1`, `install_student.bat`
+   - `install_student.ps1`, `install_student.bat`  (these write `pt_agent.conf.json` for you — no need to pre-place it)
    - (for building from source) **Python 3** from python.org with "Add to PATH" checked
 3. **Register the agent in Packet Tracer — once:**
    - Open Packet Tracer → **Extensions → IPC → Configure Apps → Add** → select `ptagent.pta` → **Ok**.
    - **Quit Packet Tracer normally** (File → Exit) so it saves the registration.
    - This is the *only* time first-time setup is done. It is stored in Packet Tracer's
      config and survives reboots and clones.
-4. **Build + config + shortcut + auto-start, in one step.** Open a terminal in the folder
-   and run (fill in the class token from the manager's **Student bootstrap...**):
-   ```
-   install_student.bat -Levelsvc "https://scoreboard.titanturtles.xyz/levels" -ClassToken "<CLASS TOKEN>"
-   ```
-   This writes `pt_agent.conf.json` (so the app loads every competition from the server —
-   students never touch a config file), builds `pt_agent.exe` if needed (from `dist\` or
+4. **Build + config + shortcut + auto-start, in one step — just double-click `install_student.bat`.**
+   It writes `pt_agent.conf.json` with the server URL + class token **baked in by default**
+   (so the app loads every competition from the server — students never touch a config file
+   or type a token, only a Team ID), builds `pt_agent.exe` if needed (from `dist\` or
    `pt_agent.py`, installing PyInstaller automatically), and creates the Desktop + Startup
    shortcuts so the app opens at login.
-   - You only need the `-Levelsvc/-ClassToken` the first time (or to change servers).
-     After that, plain `install_student.bat` just rebuilds/refreshes shortcuts.
+   - For a **different server/token**, override the baked-in defaults:
+     `install_student.bat -Levelsvc "https://.../levels" -ClassToken "<token>"`.
    - `-ForceBuild` rebuilds the exe; `-Remove` deletes the shortcuts.
-   - Get the class token: in the manager click **Student bootstrap...**, open the saved
-     `pt_agent.conf.json`, and copy its `class_token` value.
 5. **Start on boot:** enable **automatic logon** for the kiosk Windows user
    (e.g. `netplwiz` → uncheck "Users must enter a user name and password", or set
    `AutoAdminLogon`), so login — and the app — happen without a password at boot.
