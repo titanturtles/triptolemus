@@ -1,0 +1,36 @@
+{
+  "remote": "https://scoreboard.titanturtles.xyz",
+  "levelsvc": "https://scoreboard.titanturtles.xyz/levels",
+  "comp": "your-competition-id   (matches the competition id on the server; the manager fills this in)",
+  "interval": 10,
+  "_comment_launch": "auto_launch (default true): the agent opens Packet Tracer itself if it isn't running. pt_path: optional override to the PT executable if auto-detection fails.",
+  "auto_launch": true,
+  "pt_path": "",
+  "_comment_pt": "ExApp credentials baked into ptagent.pta; register ptagent.pta once per machine (Extensions > IPC > Configure Apps > Add, then quit PT normally). Secret is local PT<->agent auth only.",
+  "pt_app_id": "xyz.titanturtles.ptagent",
+  "pt_secret": "CHANGE-ME-exapp-shared-secret",
+  "_comment_levels": "One entry per level. image/password = the sarpedon image + its per-image scoring key (also added to sarpedon.conf). pt_password = the activity's stored hash from `pka_tool -pass file.pka` (omit for unlocked activities). threshold mirrors levels.json on the server (display only; the server is authoritative). The .pka files are NOT shipped to students \u2014 the server releases them.",
+  "levels": [
+    {
+      "level": 1,
+      "image": "PT-Level-1",
+      "password": "CHANGE-ME-key-1",
+      "pt_password": "CHANGE-ME-hash-1-or-omit",
+      "threshold": 100
+    },
+    {
+      "level": 2,
+      "image": "PT-Level-2",
+      "password": "CHANGE-ME-key-2",
+      "pt_password": "CHANGE-ME-hash-2-or-omit",
+      "threshold": 100
+    },
+    {
+      "level": 3,
+      "image": "PT-Level-3",
+      "password": "CHANGE-ME-key-3",
+      "pt_password": "CHANGE-ME-hash-3-or-omit",
+      "threshold": 100
+    }
+  ]
+}

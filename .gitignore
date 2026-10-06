@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Secrets & local state — distribute these out-of-band, never commit
+manager_data/
+pt_agent.conf.json
+pt_agent.bootstrap.json
+ptagent.pta
+
+# Competition content (large; the activity files themselves)
+*.pka
+
+# PyInstaller build artifacts (rebuild with packaging/build.*)
+build/
+dist/
+*.spec
+pt_agent_linux_amd64
+scoreboard_manager_linux_amd64
+
+# Go build output (build the server from source)
+levelsvc/levelsvc_linux_amd64

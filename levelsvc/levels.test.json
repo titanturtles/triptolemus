@@ -1,0 +1,13 @@
+{
+  "db": "mongodb://localhost:27017",
+  "dbName": "sarpedon",
+  "listen": "127.0.0.1:8099",
+  "filesDir": "/home/biajee/leveltest/levels",
+  "uploadDir": "/home/biajee/leveltest/submissions",
+  "maxUploadMB": 64,
+  "levels": [
+    { "level": 1, "image": "PT-2025-2026-Cisco-Test", "threshold": 10,  "file": "level1.pka" },
+    { "level": 2, "image": "PT-Level-2",               "threshold": 100, "file": "level2.pka" },
+    { "level": 3, "image": "PT-Level-3",               "threshold": 100, "file": "level3.pka" }
+  ]
+}
