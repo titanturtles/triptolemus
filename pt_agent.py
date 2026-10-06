@@ -53,13 +53,30 @@ def _encrypt(password: str, plaintext: bytes) -> str:
     return (nonce + ct).hex()
 
 
-def build_update(password, team, image, percent, items_done, items_total) -> str:
-    p = int(percent)  # truncate like Packet Tracer's on-screen % (not round), so the board matches
-    vuln = (str(int(items_done)).encode() + DELIM + str(int(items_total)).encode() + DELIM +
-            f"Completion - {p} pts".encode() + DELIM)
-    vhex = _encrypt(password, vuln).encode("ascii")
+def build_update(password, team, image, percent, items_done, items_total, items=None) -> str:
+    # sarpedon requires each vuln to be "<text> - <N> pts" and the vuln points to SUM to the
+    # score. With the per-item tree we report the aeacus-style points model: score = earned
+    # points, one vuln per earned item. Without the tree we fall back to completion %.
+    entries = []
+    if items:
+        earned = [it for it in items if it.get("earned")]
+        for it in earned[:200]:
+            name = str(it.get("name", "item")).replace("-", "/")  # '-' is sarpedon's field separator
+            entries.append((name, int(it.get("points", 0))))
+        score = sum(pts for _, pts in entries)
+        scored_count, total_count = int(items_done), int(items_total)
+        if not entries:   # nothing scored yet; one zero-point placeholder (sum 0 == score 0)
+            entries = [("No items scored yet", 0)]
+    else:
+        score = int(percent)  # truncate like PT's on-screen %
+        scored_count, total_count = int(items_done), int(items_total)
+        entries = [("Completion", score)]
+    blob = str(scored_count).encode() + DELIM + str(total_count).encode() + DELIM
+    for name, pts in entries:
+        blob += f"{name} - {pts} pts".encode("utf-8", "replace") + DELIM
+    vhex = _encrypt(password, blob).encode("ascii")
     upd = (b"team" + DELIM + team.encode() + DELIM + b"image" + DELIM + image.encode() + DELIM +
-           b"score" + DELIM + str(p).encode() + DELIM + b"vulns" + DELIM + vhex + DELIM +
+           b"score" + DELIM + str(score).encode() + DELIM + b"vulns" + DELIM + vhex + DELIM +
            b"time" + DELIM + str(int(time.time())).encode() + DELIM)
     return _encrypt(password, upd)
 
@@ -238,6 +255,45 @@ class PTMPClient:
         total = int(self.active("getAssessmentItemsCount"))
         done = int(self.active("getCorrectAssessmentItemsCount"))
         return title, pct, done, total
+
+    def read_items(self, cap=250):
+        """Walk getAssessedComparatorTree() and return the scored leaf items:
+        [{name, points, earned}]. Best-effort: returns [] if the tree API is absent.
+        Each leaf's getCheckType() is 2 (correct) / 1 (partial) / 0 (incorrect)."""
+        base = [("appWindow",), ("getActiveFile",), ("getAssessedComparatorTree",)]
+
+        def prop(path, name, *a):
+            return self.call(*(base + [("getChildNodeAt", i) for i in path] + [(name,) + a]))
+
+        out = []
+
+        def walk(path, names):
+            if len(out) >= cap:
+                return
+            try:
+                n = prop(path, "getChildCount")
+                nm = str(prop(path, "getNodeName"))
+            except PTMPError:
+                return
+            names2 = names + [nm] if nm else names
+            if not isinstance(n, (int, float)) or int(n) <= 0:   # leaf
+                try:
+                    ct = prop(path, "getCheckType")
+                    pts = prop(path, "getTotalLeafPoints")
+                except PTMPError:
+                    return
+                out.append({"name": " / ".join(names2[1:]) or nm,   # drop the "Network" root
+                            "points": int(pts) if isinstance(pts, (int, float)) else 0,
+                            "earned": (ct == 2)})
+                return
+            for i in range(int(n)):
+                walk(path + [i], names2)
+
+        try:
+            walk([], [])
+        except Exception:
+            pass
+        return out
 
     def close(self):
         if self.sock:
@@ -574,11 +630,15 @@ class Competition:
                 try:
                     with self.io_lock:
                         _title, pct, done, total = self.client.read_activity(lc.get("pt_password"))
+                        items = self.client.read_items()
                     live_pct = pct
-                    upd = build_update(lc["password"], self.team, lc["image"], pct, done, total)
+                    upd = build_update(lc["password"], self.team, lc["image"], pct, done, total, items)
                     code = post_update(self.cfg["remote"], upd)
                     tag = "OK" if code == 200 else f"rejected({code})"
-                    self.report("log", f"Level {self.current}: {int(pct)}% ({done}/{total}) -> {tag}")
+                    epts = sum(i["points"] for i in items if i.get("earned"))
+                    tpts = sum(i["points"] for i in items)
+                    extra = f", {epts}/{tpts} pts" if items else ""
+                    self.report("log", f"Level {self.current}: {int(pct)}% ({done}/{total} items{extra}) -> {tag}")
                 except PTMPError as e:
                     self.report("log", f"Read error: {e}")
 

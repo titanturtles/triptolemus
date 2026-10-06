@@ -124,20 +124,27 @@ func resolveComp(c Config, id string) *Competition {
 	return nil
 }
 
+// maxPoints returns a team's best item-completion percentage (0-100) on an image,
+// computed from the recorded vuln counts (sarpedon stores vulnsscored/vulnstotal).
+// Gating keys off item completion %, which matches Packet Tracer's on-screen % and is
+// independent of the points the board shows. Name kept for the single caller below.
 func maxPoints(team, image string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var res struct {
-		Points int `bson:"points"`
+		Vulns struct {
+			Scored int `bson:"vulnsscored"`
+			Total  int `bson:"vulnstotal"`
+		} `bson:"vulns"`
 	}
 	err := scores.FindOne(ctx,
 		bson.M{"team.id": team, "image.name": image},
-		options.FindOne().SetSort(bson.D{{Key: "points", Value: -1}}),
+		options.FindOne().SetSort(bson.D{{Key: "vulns.vulnsscored", Value: -1}}),
 	).Decode(&res)
-	if err != nil {
+	if err != nil || res.Vulns.Total <= 0 {
 		return 0
 	}
-	return res.Points
+	return res.Vulns.Scored * 100 / res.Vulns.Total
 }
 
 type levelStatus struct {
