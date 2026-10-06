@@ -825,6 +825,23 @@ func slug(s string) string {
 }
 
 var hex32 = regexp.MustCompile(`^[0-9A-Fa-f]{32}$`)
+var keepChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// slugImage builds a human-readable image/file name from the uploaded .pka filename,
+// e.g. comp "test2", level 1, file "test2-L1-276.pka" -> "test2-L1-276".
+func slugImage(comp string, level int, filename string) string {
+	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	base = keepChars.ReplaceAllString(strings.ReplaceAll(base, " ", "-"), "")
+	img := fmt.Sprintf("%s-L%d-%s", comp, level, base)
+	if len(img) > 60 {
+		img = img[:60]
+	}
+	return strings.Trim(img, "-")
+}
+
+func imageBlock(image, key string) string {
+	return fmt.Sprintf("[[image]]\nname = %q\ncolor = \"#1BA0E2\"\npassword = %q\n\n", image, key)
+}
 
 // pkaHash shells out to pka_tool -pass to read an activity's stored password hash;
 // returns "" for unlocked activities (or if pka_tool is unavailable).
@@ -888,7 +905,9 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		data, _ := io.ReadAll(f)
 		f.Close()
-		pkaPath := filepath.Join(dir, fmt.Sprintf("level%d.pka", i))
+		image := slugImage(comp, i, fhs[0].Filename)
+		fn := image + ".pka"
+		pkaPath := filepath.Join(dir, fn)
 		if err := os.WriteFile(pkaPath, data, 0644); err != nil {
 			http.Error(w, "cannot store level file: "+err.Error(), 500)
 			return
@@ -899,10 +918,9 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		if thr <= 0 {
 			thr = 100
 		}
-		image := fmt.Sprintf("%s-L%d", comp, i)
 		newLevels = append(newLevels, Level{Level: i, Image: image, Threshold: thr,
-			File: fmt.Sprintf("level%d.pka", i), Password: key, PtPassword: hash})
-		sarpBlocks.WriteString(fmt.Sprintf("[[image]]\nname = %q\ncolor = \"#1BA0E2\"\npassword = %q\n\n", image, key))
+			File: fn, Password: key, PtPassword: hash})
+		sarpBlocks.WriteString(imageBlock(image, key))
 	}
 	if len(newLevels) == 0 {
 		http.Error(w, "upload at least one .pka (field level1, level2, ...)", 400)
@@ -934,6 +952,113 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Printf("create comp=%s: %d levels, %d images", comp, len(newLevels), imgs)
+	writeJSON(w, map[string]interface{}{"status": "OK", "comp": comp, "levels": len(newLevels), "images_added": imgs})
+}
+
+// adminUpdate edits an existing competition: rename, change per-level thresholds, and
+// add / remove / replace / reorder levels. Each submitted row either uploads a new .pka
+// (regenerated) or keeps an existing level by image name (file/key/hash reused).
+func adminUpdate(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if !admin(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
+		http.Error(w, "bad multipart form: "+err.Error(), 400)
+		return
+	}
+	comp := r.FormValue("comp")
+	name := strings.TrimSpace(r.FormValue("name"))
+	practice := r.FormValue("practice") != ""
+	if comp == "" {
+		http.Error(w, "comp required", 400)
+		return
+	}
+	c := snapshot()
+	byImage := map[string]Level{}
+	found := false
+	for _, cp := range c.Competitions {
+		if cp.ID == comp {
+			found = true
+			for _, l := range cp.Levels {
+				byImage[l.Image] = l
+			}
+		}
+	}
+	if !found {
+		http.Error(w, "no such competition", 404)
+		return
+	}
+	if name == "" {
+		name = comp
+	}
+	dir := filepath.Join(c.FilesDir, comp)
+	os.MkdirAll(dir, 0755)
+	var newLevels []Level
+	var sarpBlocks strings.Builder
+	k := 0
+	for i := 1; i <= 50; i++ {
+		keep := strings.TrimSpace(r.FormValue(fmt.Sprintf("keep%d", i)))
+		fhs := r.MultipartForm.File[fmt.Sprintf("level%d", i)]
+		hasFile := len(fhs) > 0 && fhs[0].Filename != ""
+		if !hasFile && keep == "" {
+			continue
+		}
+		k++
+		thr, _ := strconv.Atoi(strings.TrimSpace(r.FormValue(fmt.Sprintf("threshold%d", i))))
+		if thr <= 0 {
+			thr = 100
+		}
+		if hasFile {
+			f, err := fhs[0].Open()
+			if err != nil {
+				http.Error(w, "cannot read uploaded level", 400)
+				return
+			}
+			data, _ := io.ReadAll(f)
+			f.Close()
+			image := slugImage(comp, k, fhs[0].Filename)
+			fn := image + ".pka"
+			if err := os.WriteFile(filepath.Join(dir, fn), data, 0644); err != nil {
+				http.Error(w, "cannot store level file: "+err.Error(), 500)
+				return
+			}
+			hash := pkaHash(c.PkaTool, filepath.Join(dir, fn))
+			key := "ptk_" + randHex(16)
+			newLevels = append(newLevels, Level{Level: k, Image: image, Threshold: thr, File: fn, Password: key, PtPassword: hash})
+			sarpBlocks.WriteString(imageBlock(image, key))
+		} else if ex, ok := byImage[keep]; ok {
+			ex.Level = k
+			ex.Threshold = thr
+			newLevels = append(newLevels, ex)
+		}
+	}
+	if len(newLevels) == 0 {
+		http.Error(w, "a competition needs at least one level", 400)
+		return
+	}
+	cfgMu.Lock()
+	for i := range cfg.Competitions {
+		if cfg.Competitions[i].ID == comp {
+			cfg.Competitions[i].Name = name
+			cfg.Competitions[i].Practice = practice
+			cfg.Competitions[i].Levels = newLevels
+		}
+	}
+	persistLocked()
+	cfgMu.Unlock()
+	imgs := 0
+	if c.SarpConf != "" && sarpBlocks.Len() > 0 {
+		if n, err := appendSarpImages(sarpBlocks.String(), c.SarpConf); err == nil {
+			imgs = n
+		}
+	}
+	log.Printf("update comp=%s: %d levels, %d new images", comp, len(newLevels), imgs)
 	writeJSON(w, map[string]interface{}{"status": "OK", "comp": comp, "levels": len(newLevels), "images_added": imgs})
 }
 
@@ -1094,6 +1219,7 @@ func main() {
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)
 	http.HandleFunc("/admin/create", adminCreate)
+	http.HandleFunc("/admin/update", adminUpdate)
 	http.HandleFunc("/admin/competition", adminCompetition)
 	http.HandleFunc("/admin/submissions", adminSubmissions)
 	http.HandleFunc("/admin/submission", adminSubmission)
