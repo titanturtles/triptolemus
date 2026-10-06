@@ -29,6 +29,11 @@ if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "-r" ]; then
   exit 0
 fi
 
+# --force / -f : rebuild the binary from source even if one exists
+if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+  rm -f "$EXE" "$HERE/dist/pt_agent"
+fi
+
 # 1) ensure the binary
 if [ ! -x "$EXE" ]; then
   if [ -x "$HERE/dist/pt_agent" ]; then
