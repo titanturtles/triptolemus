@@ -4,9 +4,16 @@ This is everything you need to run Packet Tracer competitions on the TitanTurtle
 scoreboard. You do all of it from the **Cisco Scoreboard Manager** app over HTTPS —
 no SSH, no server login.
 
-- **You** use `scoreboard_manager` (the manager app).
+- **You** use `scoreboard_manager` (the manager app) — **or** the browser web console
+  built into the sarpedon scoreboard (log in → **PT Competitions**). Both do the same
+  thing (create / edit / default / hide / remove / review); they drive this repo's
+  `levelsvc` and are interchangeable. The web console lives in the TitanTurtles
+  **sarpedon** fork (`github.com/titanturtles/sarpedon`).
 - **Students** use `pt_agent` (the competition app) on their machines/VMs.
-- The scoreboard server runs sarpedon + `levelsvc`; it's already set up.
+- The scoreboard server runs sarpedon + `levelsvc` (this repo); it's already set up.
+- This repo (**triptolemus**) is the PT‑competition half: `levelsvc` (server engine),
+  `pt_agent` (student app), `pka_tool`, and the setup docs. The scoreboard UI/auth lives
+  in the sarpedon fork.
 
 The two sibling docs:
 - `WINDOWS_VM_SETUP.md` — building the student Windows VM image (one time).
