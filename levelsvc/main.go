@@ -47,6 +47,7 @@ import (
 
 type Level struct {
 	Level      int    `json:"level"`
+	Name       string `json:"name,omitempty"` // human label shown to students
 	Image      string `json:"image"`
 	Threshold  int    `json:"threshold"`
 	File       string `json:"file"`
@@ -918,7 +919,11 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		if thr <= 0 {
 			thr = 100
 		}
-		newLevels = append(newLevels, Level{Level: i, Image: image, Threshold: thr,
+		lvName := strings.TrimSpace(r.FormValue(fmt.Sprintf("levelname%d", i)))
+		if lvName == "" {
+			lvName = fmt.Sprintf("Level %d", i)
+		}
+		newLevels = append(newLevels, Level{Level: i, Name: lvName, Image: image, Threshold: thr,
 			File: fn, Password: key, PtPassword: hash})
 		sarpBlocks.WriteString(imageBlock(image, key))
 	}
@@ -1014,6 +1019,7 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 		if thr <= 0 {
 			thr = 100
 		}
+		lvName := strings.TrimSpace(r.FormValue(fmt.Sprintf("levelname%d", i)))
 		if hasFile {
 			f, err := fhs[0].Open()
 			if err != nil {
@@ -1030,11 +1036,19 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			hash := pkaHash(c.PkaTool, filepath.Join(dir, fn))
 			key := "ptk_" + randHex(16)
-			newLevels = append(newLevels, Level{Level: k, Image: image, Threshold: thr, File: fn, Password: key, PtPassword: hash})
+			if lvName == "" {
+				lvName = fmt.Sprintf("Level %d", k)
+			}
+			newLevels = append(newLevels, Level{Level: k, Name: lvName, Image: image, Threshold: thr, File: fn, Password: key, PtPassword: hash})
 			sarpBlocks.WriteString(imageBlock(image, key))
 		} else if ex, ok := byImage[keep]; ok {
 			ex.Level = k
 			ex.Threshold = thr
+			if lvName != "" {
+				ex.Name = lvName
+			} else if ex.Name == "" {
+				ex.Name = fmt.Sprintf("Level %d", k)
+			}
 			newLevels = append(newLevels, ex)
 		}
 	}
@@ -1079,7 +1093,7 @@ func adminAgentConfig(w http.ResponseWriter, r *http.Request) {
 	levels := []map[string]interface{}{}
 	for _, l := range cp.Levels {
 		levels = append(levels, map[string]interface{}{
-			"level": l.Level, "image": l.Image, "threshold": l.Threshold,
+			"level": l.Level, "levelName": l.Name, "image": l.Image, "threshold": l.Threshold,
 			"password": l.Password, "ptPassword": l.PtPassword,
 		})
 	}
@@ -1112,7 +1126,7 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 		levels := []map[string]interface{}{}
 		for _, l := range cp.Levels {
 			levels = append(levels, map[string]interface{}{
-				"level": l.Level, "image": l.Image, "threshold": l.Threshold,
+				"level": l.Level, "name": l.Name, "image": l.Image, "threshold": l.Threshold,
 				"password": l.Password, "pt_password": l.PtPassword,
 			})
 		}
