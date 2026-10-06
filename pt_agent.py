@@ -939,9 +939,10 @@ def run_gui(cfg, conf_dir):
         level_rows.clear()
         for lc in levels:
             n = int(lc["level"])
+            label = lc.get("name") or f"Level {n}"
             row = ttk.Frame(cards_frame)
             row.pack(fill="x", pady=2)
-            ttk.Label(row, text=f"Level {n}", width=10, font=("TkDefaultFont", 10, "bold")).pack(side="left")
+            ttk.Label(row, text=label, width=26, font=("TkDefaultFont", 10, "bold")).pack(side="left")
             sv = tk.StringVar(value="… ready" if n == 1 else "🔒 locked")
             lbl = ttk.Label(row, textvariable=sv, foreground="#888")
             lbl.pack(side="left")
