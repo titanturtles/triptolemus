@@ -75,6 +75,12 @@ if (-not (Test-Path $exe)) {
     if (-not $py) { Write-Error "Python 3 not found. Install it from https://python.org (check 'Add Python to PATH'), then run this again."; exit 1 }
     Write-Host "Using Python: $py $($pyargs -join ' ')"
 
+    # ensure pip (python.org Python ships it; recover with ensurepip if missing)
+    & $py @pyargs -m pip --version > $null 2>&1
+    if ($LASTEXITCODE -ne 0) { & $py @pyargs -m ensurepip --upgrade 2>&1 | Out-Null }
+    & $py @pyargs -m pip --version > $null 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Error "pip is unavailable. Reinstall Python from python.org with pip, or drop a prebuilt pt_agent.exe / dist\pt_agent.exe in this folder and re-run."; exit 1 }
+
     # ensure build deps
     & $py @pyargs -m pip install --disable-pip-version-check --quiet --upgrade pyinstaller cryptography
     if ($LASTEXITCODE -ne 0) { Write-Error "Could not install PyInstaller/cryptography with pip."; exit 1 }

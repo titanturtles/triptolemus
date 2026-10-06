@@ -35,23 +35,33 @@ if [ ! -x "$EXE" ]; then
     cp "$HERE/dist/pt_agent" "$EXE"; echo "[*] used dist/pt_agent"
   elif [ -f "$HERE/pt_agent.py" ]; then
     echo "[*] building pt_agent from source (first run can take a minute)..."
+    SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+    HAVE_APT=0; command -v apt-get >/dev/null 2>&1 && HAVE_APT=1
+    apt_install() {   # best-effort; never aborts the script (set -e safe)
+      echo "[*] installing build dependency: $*"
+      $SUDO apt-get update -y >/dev/null 2>&1 || true
+      $SUDO apt-get install -y "$@" || true
+    }
     PY="$(command -v python3 || command -v python || true)"
-    [ -n "$PY" ] || { echo "ERROR: Python 3 not found. Install: sudo apt install -y python3 python3-tk python3-pip"; exit 1; }
-    if ! "$PY" -m pip --version >/dev/null 2>&1; then
-      "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    if [ -z "$PY" ]; then
+      [ "$HAVE_APT" = 1 ] && apt_install python3 python3-tk python3-pip
+      PY="$(command -v python3 || command -v python || true)"
     fi
+    [ -n "$PY" ] || { echo "ERROR: Python 3 not found and could not auto-install it. Install python3 python3-tk python3-pip, or drop a prebuilt 'pt_agent' binary here."; exit 1; }
+
+    # ensure pip (ensurepip, then apt)
+    if ! "$PY" -m pip --version >/dev/null 2>&1; then "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true; fi
+    if ! "$PY" -m pip --version >/dev/null 2>&1 && [ "$HAVE_APT" = 1 ]; then apt_install python3-pip; fi
     if ! "$PY" -m pip --version >/dev/null 2>&1; then
-      echo "ERROR: Python pip is not installed."
-      echo "  Fix (as root):  apt update && apt install -y python3-pip python3-tk"
-      echo "  then re-run:    ./install_student.sh"
-      echo "  Or skip building: put a prebuilt 'pt_agent' binary in $HERE and re-run."
-      exit 1
+      echo "ERROR: pip unavailable and auto-install failed. Install python3-pip (or drop a prebuilt 'pt_agent' binary here)."; exit 1
     fi
+
+    # ensure tkinter (apt)
+    if ! "$PY" -c 'import tkinter' >/dev/null 2>&1 && [ "$HAVE_APT" = 1 ]; then apt_install python3-tk; fi
     if ! "$PY" -c 'import tkinter' >/dev/null 2>&1; then
-      echo "ERROR: Python tkinter is missing (needed for the GUI)."
-      echo "  Fix (as root):  apt install -y python3-tk   then re-run ./install_student.sh"
-      exit 1
+      echo "ERROR: tkinter unavailable and auto-install failed. Install python3-tk."; exit 1
     fi
+
     "$PY" -m pip install --quiet --upgrade pyinstaller cryptography \
       || "$PY" -m pip install --user --quiet --upgrade pyinstaller cryptography
     "$PY" -m PyInstaller --onefile --name pt_agent --noconfirm \
