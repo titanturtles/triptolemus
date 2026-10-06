@@ -857,11 +857,13 @@ def run_gui(cfg, conf_dir):
     root = tk.Tk()
     root.title("TitanTurtles — Packet Tracer Competition")
     root.geometry("680x600")
-    root.resizable(False, False)  # fixed size; also stops Linux WMs auto-maximizing on autostart
 
+    # Open at a normal size even if the window manager tries to maximize a new window on
+    # autostart. The window stays resizable; we just clear any maximized state right after
+    # it maps (a few times, to beat the WM's maximize-on-map).
     def _nomaximize():
         try:
-            root.attributes("-zoomed", False)  # Linux: clear a maximized state the WM may have set
+            root.attributes("-zoomed", False)  # Linux WM maximized flag
         except Exception:
             pass
         try:
@@ -869,7 +871,8 @@ def run_gui(cfg, conf_dir):
         except Exception:
             pass
         root.geometry("680x600")
-    root.after(300, _nomaximize)
+    for _d in (80, 400, 1000):
+        root.after(_d, _nomaximize)
     intro = ttk.Label(
         root, wraplength=580, justify="left", foreground="#2f5e97", padding=(10, 8, 10, 0),
         text="How to use:   1) Open Packet Tracer (register the agent once: Extensions → IPC → "
