@@ -32,6 +32,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -68,11 +69,12 @@ type agentConf struct {
 }
 
 type Competition struct {
-	ID      string  `json:"id"`
-	Name    string  `json:"name"`
-	Hidden  bool    `json:"hidden"`
-	Default bool    `json:"default,omitempty"`
-	Levels  []Level `json:"levels"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Hidden   bool    `json:"hidden"`
+	Default  bool    `json:"default,omitempty"`
+	Practice bool    `json:"practice,omitempty"` // label only; no behavior change
+	Levels   []Level `json:"levels"`
 }
 
 type Config struct {
@@ -86,6 +88,7 @@ type Config struct {
 	ClassToken   string        `json:"classToken"` // student-facing token for GET /enroll
 	SarpConf     string        `json:"sarpConf"`
 	ProgressDir  string        `json:"progressDir"`
+	PkaTool      string        `json:"pkaTool"`  // path to the pka_tool binary (for server-side hash extraction)
 	Remote       string        `json:"remote"`   // sarpedon base URL students POST scores to
 	PtAppID      string        `json:"ptAppId"`  // shared ExApp id (same for all competitions)
 	PtSecret     string        `json:"ptSecret"` // shared ExApp secret
@@ -355,7 +358,8 @@ func adminCompetitions(w http.ResponseWriter, r *http.Request) {
 	for _, cp := range c.Competitions {
 		list = append(list, map[string]interface{}{
 			"id": cp.ID, "name": cp.Name, "hidden": cp.Hidden, "default": cp.Default,
-			"levels": len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
+			"practice": cp.Practice,
+			"levels":   len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
 		})
 	}
 	writeJSON(w, map[string]interface{}{"competitions": list})
@@ -809,6 +813,130 @@ func adminRestore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"status": "OK", "comp": comp, "team": team, "level": n, "bytes": len(data)})
 }
 
+var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+func slug(s string) string {
+	s = slugRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = "comp"
+	}
+	return s
+}
+
+var hex32 = regexp.MustCompile(`^[0-9A-Fa-f]{32}$`)
+
+// pkaHash shells out to pka_tool -pass to read an activity's stored password hash;
+// returns "" for unlocked activities (or if pka_tool is unavailable).
+func pkaHash(tool, pkaPath string) string {
+	if tool == "" {
+		return ""
+	}
+	out, err := exec.Command(tool, "-pass", pkaPath).Output()
+	if err != nil {
+		return ""
+	}
+	h := strings.TrimSpace(string(out))
+	if hex32.MatchString(h) {
+		return h
+	}
+	return ""
+}
+
+// adminCreate builds and deploys a competition from uploaded .pka files (the web
+// path): for each level it extracts the activity hash, generates a scoring key and
+// sarpedon image block, stores the file, and registers the competition.
+func adminCreate(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if !admin(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
+		http.Error(w, "bad multipart form: "+err.Error(), 400)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		http.Error(w, "name required", 400)
+		return
+	}
+	comp := r.FormValue("comp")
+	if comp == "" {
+		comp = slug(name)
+	}
+	practice := r.FormValue("practice") != ""
+	c := snapshot()
+	dir := filepath.Join(c.FilesDir, comp)
+	os.MkdirAll(dir, 0755)
+
+	var newLevels []Level
+	var sarpBlocks strings.Builder
+	for i := 1; ; i++ {
+		fhs := r.MultipartForm.File[fmt.Sprintf("level%d", i)]
+		if len(fhs) == 0 {
+			break
+		}
+		f, err := fhs[0].Open()
+		if err != nil {
+			http.Error(w, "cannot read uploaded level", 400)
+			return
+		}
+		data, _ := io.ReadAll(f)
+		f.Close()
+		pkaPath := filepath.Join(dir, fmt.Sprintf("level%d.pka", i))
+		if err := os.WriteFile(pkaPath, data, 0644); err != nil {
+			http.Error(w, "cannot store level file: "+err.Error(), 500)
+			return
+		}
+		hash := pkaHash(c.PkaTool, pkaPath)
+		key := "ptk_" + randHex(16)
+		thr, _ := strconv.Atoi(strings.TrimSpace(r.FormValue(fmt.Sprintf("threshold%d", i))))
+		if thr <= 0 {
+			thr = 100
+		}
+		image := fmt.Sprintf("%s-L%d", comp, i)
+		newLevels = append(newLevels, Level{Level: i, Image: image, Threshold: thr,
+			File: fmt.Sprintf("level%d.pka", i), Password: key, PtPassword: hash})
+		sarpBlocks.WriteString(fmt.Sprintf("[[image]]\nname = %q\ncolor = \"#1BA0E2\"\npassword = %q\n\n", image, key))
+	}
+	if len(newLevels) == 0 {
+		http.Error(w, "upload at least one .pka (field level1, level2, ...)", 400)
+		return
+	}
+
+	cfgMu.Lock()
+	found := false
+	for i := range cfg.Competitions {
+		if cfg.Competitions[i].ID == comp {
+			cfg.Competitions[i].Name = name
+			cfg.Competitions[i].Practice = practice
+			cfg.Competitions[i].Levels = newLevels
+			found = true
+		}
+	}
+	if !found {
+		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Levels: newLevels})
+	}
+	persistLocked()
+	cfgMu.Unlock()
+
+	imgs := 0
+	if c.SarpConf != "" {
+		if n, err := appendSarpImages(sarpBlocks.String(), c.SarpConf); err == nil {
+			imgs = n
+		} else {
+			log.Printf("adminCreate appendSarpImages: %v", err)
+		}
+	}
+	log.Printf("create comp=%s: %d levels, %d images", comp, len(newLevels), imgs)
+	writeJSON(w, map[string]interface{}{"status": "OK", "comp": comp, "levels": len(newLevels), "images_added": imgs})
+}
+
 // adminAgentConfig returns a competition's per-level key + hash so the manager can
 // rebuild pt_agent.conf.json from the server (without local manifests).
 func adminAgentConfig(w http.ResponseWriter, r *http.Request) {
@@ -925,6 +1053,9 @@ func main() {
 	if cfg.ProgressDir == "" {
 		cfg.ProgressDir = "/opt/levelsvc/progress"
 	}
+	if cfg.PkaTool == "" {
+		cfg.PkaTool = "/opt/levelsvc/pka_tool"
+	}
 	if cfg.ClassToken == "" {
 		cfg.ClassToken = randHex(24)
 		persistLocked()
@@ -962,6 +1093,7 @@ func main() {
 	http.HandleFunc("/admin/competitions", adminCompetitions)
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)
+	http.HandleFunc("/admin/create", adminCreate)
 	http.HandleFunc("/admin/competition", adminCompetition)
 	http.HandleFunc("/admin/submissions", adminSubmissions)
 	http.HandleFunc("/admin/submission", adminSubmission)
