@@ -61,21 +61,19 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
-    # A Linux binary only runs where glibc is at least as new as where it was built. Build on
-    # Ubuntu 22.04 (glibc 2.35) so it also runs on Linux Mint 21 / Ubuntu 22.04 and newer.
-    container: ubuntu:22.04
+    # A Linux binary only runs where glibc is at least as new as where it was built. Build in
+    # Debian 11 (glibc 2.31) so it runs on Linux Mint 21 / Ubuntu 22.04 and newer. The official
+    # python image already has Python 3.12 with Tk and build tools, so there's no apt step
+    # (Ubuntu's package mirrors have repeatedly hung or refused connections from these runners).
+    container: python:3.12-bullseye
     timeout-minutes: 20
-    env:
-      DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v4
-      - name: Install Python + Tk + build deps
-        timeout-minutes: 8   # a hung package mirror once stalled this step indefinitely
+      - name: Install build deps
+        timeout-minutes: 8
         run: |
-          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
-          apt-get $APT update
-          apt-get $APT install -y python3 python3-venv python3-tk binutils curl ca-certificates
-          python3 -m venv --system-site-packages .venv
+          python -c "import tkinter; print('Python has Tk', tkinter.TkVersion)"
+          python -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip pyinstaller cryptography
       - name: Read AGENT_VERSION
@@ -89,7 +87,7 @@ jobs:
         run: |
           . .venv/bin/activate
           pyinstaller --onefile --windowed --name pt_agent --noconfirm pt_agent.py
-      - name: Check it runs on glibc 2.35 (Ubuntu 22.04 / Linux Mint 21)
+      - name: Check it runs on older Linux (needs glibc 2.35 or older, e.g. Mint 21)
         run: |
           ./dist/pt_agent --version
           . .venv/bin/activate
