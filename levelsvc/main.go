@@ -35,6 +35,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1277,8 +1278,47 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 // ---------------- agent auto-update ----------------
 
 type agentManifest struct {
-	Version string            `json:"version"`
-	Files   map[string]string `json:"files"` // platform -> stored filename
+	Version  string            `json:"version"`            // highest published version (informational)
+	Files    map[string]string `json:"files"`              // platform -> stored filename
+	Versions map[string]string `json:"versions,omitempty"` // platform -> version of that file
+}
+
+// cmpVersion compares dotted versions numerically ("" sorts lowest); mirrors the agent's
+// _ver_tuple so server and client agree on what "newer" means.
+func cmpVersion(a, b string) int {
+	part := func(s string) int {
+		d := strings.Map(func(r rune) rune {
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1
+		}, s)
+		n, _ := strconv.Atoi(d)
+		return n
+	}
+	var pa, pb []string
+	if a != "" {
+		pa = strings.Split(a, ".")
+	}
+	if b != "" {
+		pb = strings.Split(b, ".")
+	}
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y int
+		if i < len(pa) {
+			x = part(pa[i])
+		}
+		if i < len(pb) {
+			y = part(pb[i])
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }
 
 func classOK(r *http.Request, c Config) bool {
@@ -1319,6 +1359,14 @@ func readAgentManifest(dir string) agentManifest {
 	if m.Files == nil {
 		m.Files = map[string]string{}
 	}
+	if m.Versions == nil {
+		m.Versions = map[string]string{}
+	}
+	for p := range m.Files { // older manifests had one shared version for every file
+		if m.Versions[p] == "" {
+			m.Versions[p] = m.Version
+		}
+	}
 	return m
 }
 
@@ -1336,11 +1384,31 @@ func agentLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := readAgentManifest(agentDir(c))
-	plats := []string{}
-	for p := range m.Files {
-		plats = append(plats, p)
+	if p := r.URL.Query().Get("platform"); p != "" { // a client that says which platform it is
+		plats := []string{}
+		if m.Files[p] != "" {
+			plats = append(plats, p)
+		}
+		writeJSON(w, map[string]interface{}{"version": m.Versions[p], "platforms": plats, "versions": m.Versions})
+		return
 	}
-	writeJSON(w, map[string]interface{}{"version": m.Version, "platforms": plats})
+	// Clients that don't name their platform get the highest version, listed only for the
+	// platforms whose file is actually at that version, so no client is ever offered a file
+	// older than the version advertised.
+	top := ""
+	for _, v := range m.Versions {
+		if cmpVersion(v, top) > 0 {
+			top = v
+		}
+	}
+	plats := []string{}
+	for p, v := range m.Versions {
+		if v == top && m.Files[p] != "" {
+			plats = append(plats, p)
+		}
+	}
+	sort.Strings(plats)
+	writeJSON(w, map[string]interface{}{"version": top, "platforms": plats, "versions": m.Versions})
 }
 
 // GET /agent/file?platform=P (class-token gated): download the published binary for P.
@@ -1414,8 +1482,14 @@ func adminAgentPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := readAgentManifest(dir)
-	m.Version = ver
 	m.Files[plat] = fn
+	m.Versions[plat] = ver // only this platform's version changes
+	m.Version = ""
+	for _, v := range m.Versions {
+		if cmpVersion(v, m.Version) > 0 {
+			m.Version = v
+		}
+	}
 	if err := writeAgentManifest(dir, m); err != nil {
 		http.Error(w, "cannot write manifest: "+err.Error(), 500)
 		return
