@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.3"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.4"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
