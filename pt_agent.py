@@ -156,15 +156,18 @@ class PTMPClient:
                     raise
                 last = e
             except OSError:
-                # TCP connected but PT didn't answer the handshake in time (still loading,
-                # or a modal dialog is open). Don't scan other ports — report clearly.
+                # TCP connected but the handshake was interrupted — timed out, or PT aborted/
+                # reset it (WinError 10053/10054). Usually PT is still loading, or a dialog or a
+                # firewall/antivirus is interfering. Don't scan other ports — report clearly.
                 try:
                     self.sock.close()
                 except Exception:
                     pass
                 self.sock = None
-                raise PTMPError("Packet Tracer accepted the connection but didn't respond in time "
-                                "(it may still be loading). Wait until it finishes opening, then click Start again.")
+                raise PTMPError("Packet Tracer's connection was interrupted before the agent could "
+                                "finish connecting (it may still be loading, or a dialog or "
+                                "firewall/antivirus is interrupting it). Wait until Packet Tracer is "
+                                "fully open, then click Start again.")
         raise PTMPError(f"Packet Tracer not reachable on {self.host}:{self.ports[0]}-{self.ports[-1]} ({last})")
 
     def _handshake(self):
@@ -565,9 +568,9 @@ class Competition:
         def try_connect():
             return PTMPClient(self.cfg["pt_app_id"], self.cfg["pt_secret"]).connect()
 
-        # "not responding" = PT is up but didn't finish the handshake in time (worth retrying);
-        # "not reachable" = no IPC port open yet (launch PT if allowed).
-        not_ready = lambda m: ("didn't respond" in m) or ("not reachable" in m)
+        # "was interrupted" = PT is up but the handshake didn't finish — timeout/abort/reset
+        # (worth retrying); "not reachable" = no IPC port open yet (launch PT if allowed).
+        not_ready = lambda m: ("was interrupted" in m) or ("not reachable" in m)
 
         try:
             return try_connect()
