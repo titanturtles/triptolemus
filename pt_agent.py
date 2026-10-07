@@ -938,7 +938,7 @@ def run_gui(cfg, conf_dir):
     server_served = bool(cfg.get("class_token"))  # bootstrap config pulls competitions from the server
 
     root = tk.Tk()
-    root.title("TitanTurtles — Packet Tracer Competition")
+    root.title(f"TitanTurtles — Packet Tracer Competition (v{AGENT_VERSION})")
     root.geometry("680x600")
 
     # Open at a normal size even if the window manager tries to maximize a new window on
@@ -1043,6 +1043,10 @@ def run_gui(cfg, conf_dir):
     log.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=6)
     frm.rowconfigure(4, weight=1)
     frm.columnconfigure(1, weight=1)
+
+    # always-visible version footer (the log scrolls; a maximized window can hide the title)
+    ttk.Label(frm, text=f"version {AGENT_VERSION}", foreground="#888").grid(
+        row=5, column=0, columnspan=3, sticky="e")
 
     def logln(s):
         log.configure(state="normal")
@@ -1377,7 +1381,7 @@ def run_gui(cfg, conf_dir):
             pass
         root.after(250, poll)
 
-    logln(f"Ready. Server: {cfg.get('levelsvc', '?')}")
+    logln(f"Ready. Agent v{AGENT_VERSION}. Server: {cfg.get('levelsvc', '?')}")
     root.after(250, poll)
     if not os.environ.get("PT_AGENT_SELFTEST"):
         load_enrollment()
