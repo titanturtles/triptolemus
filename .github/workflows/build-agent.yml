@@ -16,6 +16,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -94,3 +97,40 @@ jobs:
             -F binary=@dist/pt_agent \
             https://scoreboard.titanturtles.xyz/levels/admin/agentpublish
           echo "Published linux ${{ steps.ver.outputs.version }}"
+
+  # On a v* tag: package both builds (with their installer scripts) and attach them to the
+  # GitHub Release for that tag, creating the release if it doesn't exist yet.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Check the tag matches AGENT_VERSION
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=$(sed -n 's/^AGENT_VERSION *= *"\([^"]*\)".*/\1/p' pt_agent.py)
+          if [ "v$v" != "$TAG" ]; then
+            echo "Tag $TAG does not match AGENT_VERSION $v in pt_agent.py; bump one so they agree."
+            exit 1
+          fi
+      - name: Package and attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          mkdir -p pkg/windows pkg/linux
+          cp artifacts/pt_agent-windows-*/pt_agent.exe install_student.ps1 install_student.bat pkg/windows/
+          cp artifacts/pt_agent-linux-*/pt_agent install_student.sh pkg/linux/
+          chmod +x pkg/linux/pt_agent pkg/linux/install_student.sh   # artifacts drop the exec bit
+          (cd pkg/windows && zip -q "../../pt_agent-windows-$TAG.zip" *)
+          tar -czf "pt_agent-linux-$TAG.tar.gz" -C pkg/linux .
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" "pt_agent-windows-$TAG.zip" "pt_agent-linux-$TAG.tar.gz" --clobber
