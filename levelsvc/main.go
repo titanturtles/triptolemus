@@ -80,13 +80,98 @@ type Competition struct {
 	Levels       []Level  `json:"levels"`
 }
 
-// teamAllowed reports whether a team ID is on a competition's early-access list.
-func teamAllowed(cp Competition, team string) bool {
+// tomlStr extracts a quoted TOML value for key from a single line (key = "value"),
+// tolerating a trailing comment. Returns "" if the line isn't that key.
+func tomlStr(line, key string) string {
+	if !strings.HasPrefix(line, key) {
+		return ""
+	}
+	rest := strings.TrimSpace(line[len(key):])
+	if !strings.HasPrefix(rest, "=") {
+		return "" // guards against keys like "idle" when key is "id"
+	}
+	rest = strings.TrimSpace(rest[1:])
+	if !strings.HasPrefix(rest, "\"") {
+		return ""
+	}
+	rest = rest[1:]
+	if i := strings.Index(rest, "\""); i >= 0 {
+		return rest[:i]
+	}
+	return ""
+}
+
+// loadTeamAliases parses sarpedon.conf [[team]] blocks into a map of lowercased
+// id-or-alias -> canonical team id, so the allow-list can use either form.
+func loadTeamAliases(sarpConf string) map[string]string {
+	m := map[string]string{}
+	if sarpConf == "" {
+		return m
+	}
+	data, err := os.ReadFile(sarpConf)
+	if err != nil {
+		return m
+	}
+	var id, alias string
+	inTeam := false
+	flush := func() {
+		if id != "" {
+			m[strings.ToLower(id)] = id
+			if alias != "" {
+				m[strings.ToLower(alias)] = id
+			}
+		}
+		id, alias = "", ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "[[team]]" {
+			flush()
+			inTeam = true
+			continue
+		}
+		if strings.HasPrefix(t, "[[") { // any other block ends the team block
+			flush()
+			inTeam = false
+			continue
+		}
+		if !inTeam {
+			continue
+		}
+		if v := tomlStr(t, "id"); v != "" {
+			id = v
+		}
+		if v := tomlStr(t, "alias"); v != "" {
+			alias = v
+		}
+	}
+	flush()
+	return m
+}
+
+// canonicalTeam resolves a team id or alias to its canonical id (unknown values pass through).
+func canonicalTeam(aliases map[string]string, v string) string {
+	v = strings.TrimSpace(v)
+	if id, ok := aliases[strings.ToLower(v)]; ok {
+		return id
+	}
+	return v
+}
+
+// teamAllowed reports whether a team is on a competition's early-access list. Entries and
+// the submitted team may each be a team id OR an alias (resolved via sarpedon.conf [[team]]).
+func teamAllowed(cp Competition, team, sarpConf string) bool {
 	if team == "" {
 		return false
 	}
+	aliases := loadTeamAliases(sarpConf)
+	ct := canonicalTeam(aliases, team)
 	for _, t := range cp.AllowedTeams {
-		if strings.EqualFold(strings.TrimSpace(t), team) {
+		t = strings.TrimSpace(t)
+		if strings.EqualFold(t, team) { // direct match (fast path, no conf needed)
+			return true
+		}
+		if canonicalTeam(aliases, t) == ct { // match via id<->alias resolution
 			return true
 		}
 	}
@@ -96,8 +181,8 @@ func teamAllowed(cp Competition, team string) bool {
 // lockedFor returns a message when a team may not PLAY a competition yet (private/pre-release
 // and not on its allow-list), or "" when allowed. Private comps still appear in /enroll
 // (show-but-lock); the play endpoints call this to refuse non-listed teams.
-func lockedFor(cp *Competition, team string) string {
-	if cp != nil && cp.Private && !teamAllowed(*cp, team) {
+func lockedFor(cp *Competition, team, sarpConf string) string {
+	if cp != nil && cp.Private && !teamAllowed(*cp, team, sarpConf) {
 		return "This competition is in testing and has not been released yet."
 	}
 	return ""
@@ -258,7 +343,7 @@ func levelHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "competition not available", 403)
 		return
 	}
-	if msg := lockedFor(cp, team); msg != "" {
+	if msg := lockedFor(cp, team, c.SarpConf); msg != "" {
 		http.Error(w, msg, http.StatusLocked)
 		return
 	}
@@ -305,7 +390,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "comp, team and n required", 400)
 		return
 	}
-	if msg := lockedFor(cp, team); msg != "" {
+	if msg := lockedFor(cp, team, c.SarpConf); msg != "" {
 		http.Error(w, msg, http.StatusLocked)
 		return
 	}
@@ -341,7 +426,7 @@ func progressHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "comp, team and n required", 400)
 		return
 	}
-	if msg := lockedFor(cp, team); msg != "" {
+	if msg := lockedFor(cp, team, c.SarpConf); msg != "" {
 		http.Error(w, msg, http.StatusLocked)
 		return
 	}
@@ -1231,7 +1316,7 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "comp and team required", 400)
 		return
 	}
-	if msg := lockedFor(cp, team); msg != "" {
+	if msg := lockedFor(cp, team, c.SarpConf); msg != "" {
 		http.Error(w, msg, http.StatusLocked)
 		return
 	}
