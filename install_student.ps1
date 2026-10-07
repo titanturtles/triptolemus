@@ -61,7 +61,8 @@ if (-not (Test-Path $exe)) {
         Write-Error "No pt_agent.exe, dist\pt_agent.exe, or pt_agent.py in this folder:`n  $here`nCopy pt_agent.py (or a prebuilt pt_agent.exe) here and run again."
         exit 1
     }
-    Write-Host "Building pt_agent.exe from pt_agent.py (first run can take a minute)..."
+    $ver = (Select-String -Path $src -Pattern 'AGENT_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+    Write-Host "Building pt_agent.exe version $ver from pt_agent.py (first run can take a minute)..."
 
     # find a Python
     $py = $null; $pyargs = @()
@@ -92,7 +93,7 @@ if (-not (Test-Path $exe)) {
     & $py @pyargs @paArgs
     if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $dist))) { Write-Error "PyInstaller build failed."; exit 1 }
     Copy-Item $dist $exe -Force
-    Write-Host "Built pt_agent.exe"
+    Write-Host "Built pt_agent.exe version $ver  -- publish '$ver' on the console's App update page."
 }
 
 # warn (non-fatal) if the runtime config files are missing

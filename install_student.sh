@@ -39,7 +39,8 @@ if [ ! -x "$EXE" ]; then
   if [ -x "$HERE/dist/pt_agent" ]; then
     cp "$HERE/dist/pt_agent" "$EXE"; echo "[*] used dist/pt_agent"
   elif [ -f "$HERE/pt_agent.py" ]; then
-    echo "[*] building pt_agent from source (first run can take a minute)..."
+    VER="$(sed -n 's/^AGENT_VERSION *= *"\([^"]*\)".*/\1/p' "$HERE/pt_agent.py")"
+    echo "[*] building pt_agent version ${VER:-?} from source (first run can take a minute)..."
     SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
     HAVE_APT=0; command -v apt-get >/dev/null 2>&1 && HAVE_APT=1
     apt_install() {   # best-effort; never aborts the script (set -e safe)
@@ -72,11 +73,15 @@ if [ ! -x "$EXE" ]; then
     "$PY" -m PyInstaller --onefile --name pt_agent --noconfirm \
       --distpath "$HERE/dist" --workpath "$HERE/build" --specpath "$HERE" "$HERE/pt_agent.py"
     cp "$HERE/dist/pt_agent" "$EXE"
+    echo "[+] built pt_agent version ${VER:-?}  (publish this version on the console's App update page)"
   else
     echo "ERROR: need pt_agent, dist/pt_agent, or pt_agent.py in $HERE"; exit 1
   fi
 fi
 chmod +x "$EXE"
+# report the built binary's version (works even when the file was prebuilt/copied)
+BUILT_VER="$("$EXE" --version 2>/dev/null | awk '{print $NF}')"
+[ -n "$BUILT_VER" ] && echo "[*] pt_agent version: $BUILT_VER"
 
 # 2) server config (baked-in defaults; students only enter a Team ID)
 cat > "$HERE/pt_agent.conf.json" <<CONF

@@ -1589,6 +1589,7 @@ def _update_with_splash(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="Packet Tracer competition agent (levels)")
+    ap.add_argument("--version", action="version", version=f"pt_agent {AGENT_VERSION}")
     ap.add_argument("-c", "--config", default=CONF_DEFAULT)
     ap.add_argument("--gui", action="store_true", help="force the GUI")
     ap.add_argument("--cli", action="store_true", help="headless loop")
