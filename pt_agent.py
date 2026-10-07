@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.2"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.3"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1479,61 +1479,84 @@ def _relaunch_env():
     return env
 
 
-def _spawn_updater(new_path, target_path):
-    """Replace target_path with new_path once this process exits, then relaunch it.
-    Progress goes to pt_agent.update.log next to the app."""
-    pid = os.getpid()
-    log = os.path.join(os.path.dirname(target_path), "pt_agent.update.log")
+def _log_update(target, msg, fresh=False):
+    """Append a line to pt_agent.update.log next to the app (best effort)."""
+    try:
+        path = os.path.join(os.path.dirname(target), "pt_agent.update.log")
+        with open(path, "w" if fresh else "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def _start_detached(path):
+    """Start a fresh copy of the app that outlives this process."""
+    kw = {"env": _relaunch_env(), "cwd": os.path.dirname(path)}
     if sys.platform.startswith("win"):
-        bat = new_path + ".update.bat"
-        # wait for this PID, then swap (retrying ~60s while the exe is still locked) and relaunch;
-        # if the swap never succeeds, drop the download and relaunch the old version
-        script = (
-            "@echo off\r\n"
-            f'echo waiting for {pid} > "{log}"\r\n'
-            ":wait\r\n"
-            f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul 2>&1 && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n'
-            "set /a tries=0\r\n"
-            ":swap\r\n"
-            f'move /Y "{new_path}" "{target_path}" >nul 2>&1 && goto moved\r\n'
-            "set /a tries+=1\r\n"
-            "if %tries% GEQ 60 goto giveup\r\n"
-            "ping -n 2 127.0.0.1 >nul\r\n"
-            "goto swap\r\n"
-            ":giveup\r\n"
-            f'echo swap failed, keeping the old version >> "{log}"\r\n'
-            f'del "{new_path}" >nul 2>&1\r\n'
-            "goto launch\r\n"
-            ":moved\r\n"
-            f'echo swapped >> "{log}"\r\n'
-            ":launch\r\n"
-            f'start "" "{target_path}"\r\n'
-            f'echo relaunched >> "{log}"\r\n'
-            'del "%~f0"\r\n'
-        )
-        with open(bat, "w") as f:
-            f.write(script)
-        subprocess.Popen(["cmd", "/c", bat], creationflags=0x00000008,  # DETACHED_PROCESS
-                         env=_relaunch_env())
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
-        sh = new_path + ".update.sh"
-        script = (
-            "#!/bin/sh\n"
-            f'echo "$(date) waiting for {pid}" > "{log}"\n'
-            f"while kill -0 {pid} 2>/dev/null; do sleep 0.5; done\n"
-            f'if mv -f "{new_path}" "{target_path}" >>"{log}" 2>&1; then\n'
-            f'  chmod +x "{target_path}"; echo "$(date) swapped" >>"{log}"\n'
-            "else\n"
-            f'  echo "$(date) swap failed, keeping the old version" >>"{log}"; rm -f "{new_path}"\n'
-            "fi\n"
-            f'"{target_path}" >>"{log}" 2>&1 &\n'
-            f'echo "$(date) relaunched" >>"{log}"\n'
-            'rm -- "$0"\n'
-        )
-        with open(sh, "w") as f:
-            f.write(script)
-        os.chmod(sh, 0o755)
-        subprocess.Popen(["sh", sh], start_new_session=True, env=_relaunch_env())
+        kw["start_new_session"] = True
+    subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, **kw)
+
+
+def _swap_and_relaunch(new_path, target):
+    """Put the downloaded build in place of the running one and start it. Windows won't let a
+    running exe be overwritten but does let it be renamed, so ours is moved aside to <exe>.old
+    first (removed on a later launch). Returns True only when the new version is in place AND
+    running, so the caller can exit; on any failure the current version simply keeps running
+    (no helper script: on Windows one never completed, which caused the 1.1.1/1.1.2 loop)."""
+    old = target + ".old"
+    try:
+        if os.path.exists(old):
+            os.remove(old)
+    except OSError:
+        pass
+    moved_aside = False
+    try:
+        if not sys.platform.startswith("win"):
+            # the download is a plain file; give it the running build's permissions (incl. +x)
+            os.chmod(new_path, os.stat(target).st_mode | 0o111)
+        if sys.platform.startswith("win"):
+            os.replace(target, old)
+            moved_aside = True
+        os.replace(new_path, target)
+    except OSError as e:
+        if moved_aside:
+            try:
+                os.replace(old, target)  # put the running version back
+            except OSError:
+                pass
+        try:
+            os.remove(new_path)
+        except OSError:
+            pass
+        _log_update(target, f"could not replace the app ({e}); staying on {AGENT_VERSION}")
+        return False
+    _log_update(target, "swapped in place")
+    try:
+        _start_detached(target)
+    except Exception as e:
+        # the new version is installed; it opens next time, and this copy keeps running now
+        _log_update(target, f"relaunch failed ({e}); the new version opens next time")
+        return False
+    _log_update(target, "relaunched")
+    return True
+
+
+def _cleanup_after_update():
+    """Remove leftovers: the previous build from an in-place update (it may still be locked right
+    after the update; then it goes on a later launch), plus the stale download and helper script
+    that 1.1.1/1.1.2 left behind when their Windows update stalled."""
+    if not getattr(sys, "frozen", False):
+        return
+    exe = os.path.abspath(sys.executable)
+    for leftover in (exe + ".old", exe + ".new", exe + ".new.update.bat", exe + ".new.update.sh"):
+        try:
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        except OSError:
+            pass
 
 
 def _update_available(cfg):
@@ -1545,14 +1568,17 @@ def _update_available(cfg):
     token = cfg.get("class_token")
     if not base or not token:
         return None
+    plat = _platform_key()
     try:
-        req = urllib.request.Request(base + "/agent/latest", headers={"X-Class-Token": token})
+        # naming our platform gets this platform's own version (and tells the server we're a
+        # build whose updater works on Windows)
+        url = base + "/agent/latest?platform=" + urllib.parse.quote(plat)
+        req = urllib.request.Request(url, headers={"X-Class-Token": token})
         with urllib.request.urlopen(req, timeout=6) as r:
             info = json.loads(r.read().decode())
     except Exception:
         return None
     srv_ver = info.get("version") or ""
-    plat = _platform_key()
     if not srv_ver or plat not in (info.get("platforms") or []):
         return None
     if _ver_tuple(srv_ver) <= _ver_tuple(AGENT_VERSION):
@@ -1575,8 +1601,8 @@ def _download_and_stage(cfg, plat):
             return False
         with open(new_path, "wb") as f:
             f.write(data)
-        _spawn_updater(new_path, target)
-        return True
+        _log_update(target, f"downloaded {len(data)} bytes (updating from {AGENT_VERSION})", fresh=True)
+        return _swap_and_relaunch(new_path, target)
     except Exception:
         try:
             if os.path.exists(new_path):
@@ -1658,7 +1684,9 @@ def main():
     if args.cli or args.once:
         run_cli(cfg, conf_dir, args.team, args.once, args.comp)
     else:
-        # self-update before the main window opens; if it updates, exit so the updater can swap us
+        # self-update before the main window opens; if it updates, the new copy has already been
+        # started, so just exit
+        _cleanup_after_update()
         if _update_with_splash(cfg):
             return
         run_gui(cfg, conf_dir)

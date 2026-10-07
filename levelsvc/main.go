@@ -1392,18 +1392,19 @@ func agentLatest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"version": m.Versions[p], "platforms": plats, "versions": m.Versions})
 		return
 	}
-	// Clients that don't name their platform get the highest version, listed only for the
-	// platforms whose file is actually at that version, so no client is ever offered a file
-	// older than the version advertised.
+	// Clients that don't name their platform (agents before 1.1.3) get the highest version,
+	// listed only for the platforms whose file is actually at that version, so no client is ever
+	// offered a file older than the version advertised. Windows is never offered to them: their
+	// Windows updater never completes, so an offer just makes the app close on every launch.
 	top := ""
-	for _, v := range m.Versions {
-		if cmpVersion(v, top) > 0 {
+	for p, v := range m.Versions {
+		if p != "windows" && cmpVersion(v, top) > 0 {
 			top = v
 		}
 	}
 	plats := []string{}
 	for p, v := range m.Versions {
-		if v == top && m.Files[p] != "" {
+		if p != "windows" && v == top && m.Files[p] != "" {
 			plats = append(plats, p)
 		}
 	}
