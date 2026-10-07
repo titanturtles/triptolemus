@@ -70,12 +70,50 @@ type agentConf struct {
 }
 
 type Competition struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	Hidden   bool    `json:"hidden"`
-	Default  bool    `json:"default,omitempty"`
-	Practice bool    `json:"practice,omitempty"` // label only; no behavior change
-	Levels   []Level `json:"levels"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Hidden       bool     `json:"hidden"`
+	Default      bool     `json:"default,omitempty"`
+	Practice     bool     `json:"practice,omitempty"`     // label only; no behavior change
+	Private      bool     `json:"private,omitempty"`      // when true, only AllowedTeams can see it (absent = public)
+	AllowedTeams []string `json:"allowedTeams,omitempty"` // team IDs with early (pre-release) visibility
+	Levels       []Level  `json:"levels"`
+}
+
+// teamAllowed reports whether a team ID is on a competition's early-access list.
+func teamAllowed(cp Competition, team string) bool {
+	if team == "" {
+		return false
+	}
+	for _, t := range cp.AllowedTeams {
+		if strings.EqualFold(strings.TrimSpace(t), team) {
+			return true
+		}
+	}
+	return false
+}
+
+// lockedFor returns a message when a team may not PLAY a competition yet (private/pre-release
+// and not on its allow-list), or "" when allowed. Private comps still appear in /enroll
+// (show-but-lock); the play endpoints call this to refuse non-listed teams.
+func lockedFor(cp *Competition, team string) string {
+	if cp != nil && cp.Private && !teamAllowed(*cp, team) {
+		return "This competition is in testing and has not been released yet."
+	}
+	return ""
+}
+
+// parseTeamList splits a textarea of team IDs (newline/comma/semicolon separated).
+func parseTeamList(s string) []string {
+	out := []string{}
+	for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == ';'
+	}) {
+		if t := strings.TrimSpace(tok); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 type Config struct {
@@ -220,6 +258,10 @@ func levelHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "competition not available", 403)
 		return
 	}
+	if msg := lockedFor(cp, team); msg != "" {
+		http.Error(w, msg, http.StatusLocked)
+		return
+	}
 	var lvl *Level
 	for i := range cp.Levels {
 		if cp.Levels[i].Level == n {
@@ -263,6 +305,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "comp, team and n required", 400)
 		return
 	}
+	if msg := lockedFor(cp, team); msg != "" {
+		http.Error(w, msg, http.StatusLocked)
+		return
+	}
 	limit := c.MaxUpload
 	if limit <= 0 {
 		limit = 128
@@ -293,6 +339,10 @@ func progressHandler(w http.ResponseWriter, r *http.Request) {
 	n := r.URL.Query().Get("n")
 	if cp == nil || team == "" || n == "" {
 		http.Error(w, "comp, team and n required", 400)
+		return
+	}
+	if msg := lockedFor(cp, team); msg != "" {
+		http.Error(w, msg, http.StatusLocked)
 		return
 	}
 	dir := filepath.Join(c.ProgressDir, cp.ID)
@@ -359,8 +409,8 @@ func adminCompetitions(w http.ResponseWriter, r *http.Request) {
 	for _, cp := range c.Competitions {
 		list = append(list, map[string]interface{}{
 			"id": cp.ID, "name": cp.Name, "hidden": cp.Hidden, "default": cp.Default,
-			"practice": cp.Practice,
-			"levels":   len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
+			"practice": cp.Practice, "private": cp.Private, "allowedTeams": cp.AllowedTeams,
+			"levels": len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
 		})
 	}
 	writeJSON(w, map[string]interface{}{"competitions": list})
@@ -888,6 +938,9 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		comp = slug(name)
 	}
 	practice := r.FormValue("practice") != ""
+	hasVis := r.FormValue("vis") != "" // this client manages visibility (else leave it unchanged)
+	private := hasVis && r.FormValue("public") == ""
+	allowed := parseTeamList(r.FormValue("allowedTeams"))
 	c := snapshot()
 	dir := filepath.Join(c.FilesDir, comp)
 	os.MkdirAll(dir, 0755)
@@ -938,12 +991,16 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		if cfg.Competitions[i].ID == comp {
 			cfg.Competitions[i].Name = name
 			cfg.Competitions[i].Practice = practice
+			if hasVis {
+				cfg.Competitions[i].Private = private
+				cfg.Competitions[i].AllowedTeams = allowed
+			}
 			cfg.Competitions[i].Levels = newLevels
 			found = true
 		}
 	}
 	if !found {
-		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Levels: newLevels})
+		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, Levels: newLevels})
 	}
 	persistLocked()
 	cfgMu.Unlock()
@@ -980,6 +1037,9 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	comp := r.FormValue("comp")
 	name := strings.TrimSpace(r.FormValue("name"))
 	practice := r.FormValue("practice") != ""
+	hasVis := r.FormValue("vis") != "" // this client manages visibility (else leave it unchanged)
+	private := hasVis && r.FormValue("public") == ""
+	allowed := parseTeamList(r.FormValue("allowedTeams"))
 	if comp == "" {
 		http.Error(w, "comp required", 400)
 		return
@@ -1061,6 +1121,10 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 		if cfg.Competitions[i].ID == comp {
 			cfg.Competitions[i].Name = name
 			cfg.Competitions[i].Practice = practice
+			if hasVis {
+				cfg.Competitions[i].Private = private
+				cfg.Competitions[i].AllowedTeams = allowed
+			}
 			cfg.Competitions[i].Levels = newLevels
 		}
 	}
@@ -1120,6 +1184,8 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 		if cp.Hidden {
 			continue
 		}
+		// Private competitions still appear in the list (show-but-lock): the play
+		// endpoints (/level, /upload, /progress, /reset) refuse non-listed teams.
 		if cp.Default && def == "" {
 			def = cp.ID
 		}
@@ -1163,6 +1229,10 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 	team := r.URL.Query().Get("team")
 	if cp == nil || team == "" {
 		http.Error(w, "comp and team required", 400)
+		return
+	}
+	if msg := lockedFor(cp, team); msg != "" {
+		http.Error(w, msg, http.StatusLocked)
 		return
 	}
 	images := make([]string, 0, len(cp.Levels))
