@@ -41,6 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
+AGENT_VERSION = "1.1.0"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -563,6 +564,8 @@ class Competition:
         self.cancel = cancel          # global: set when the window closes, to abort waits
         self.client = None
         self.comp = cfg.get("comp", "")
+        self.practice = bool(cfg.get("practice", False))
+        self.free_switch = False      # practice "unlock all": disables auto-advance, allows jumps
         self.levels = LevelsClient(cfg["levelsvc"])
         self.tmp = None
         self.current = None           # level number currently open in PT
@@ -674,8 +677,9 @@ class Competition:
             levels = st.get("levels", [])
             active = next((l for l in levels if l.get("unlocked") and not l.get("cleared")), None)
 
-            # a level just cleared -> advance to the newly-unlocked one (fresh copy)
-            if active and active["level"] != self.current:
+            # a level just cleared -> advance to the newly-unlocked one (fresh copy).
+            # In practice "unlock all" mode the student picks levels manually, so don't auto-advance.
+            if active and active["level"] != self.current and not self.free_switch:
                 # save + upload the level that just cleared so every level is reviewable,
                 # not just the last one the student finishes on
                 self._save(progress=True, final=True)
@@ -757,6 +761,28 @@ class Competition:
         """Discard the current level's progress and reload a clean copy, then run."""
         self._stop_loop()
         self.start(fresh=True)
+
+    def switch_level(self, n):
+        """Practice only: jump to a chosen level. Saves + uploads the level being left (so
+        every level is reviewable), then opens the chosen one, keeping the scoring loop running."""
+        if not self.client:
+            self.report("error", "Click Start first, then you can jump between levels.")
+            return
+        if n == self.current:
+            self.report("status", f"Already on level {n}.")
+            return
+        try:
+            self._save(progress=True, final=True)   # preserve the level you're leaving
+            try:
+                with self.io_lock:
+                    self.client.file_new()
+            except Exception:
+                pass
+            self._load_level(n, fresh=False)
+            self.report("status", f"Switched to level {n}.")
+        except Exception as e:
+            self.report("log", f"Could not switch to level {n}: {e}")
+            self.report("error", f"Could not switch to level {n}:\n\n{e}")
 
     def restart_all(self):
         """Erase this team's scores + progress for the whole competition on the server, then
@@ -896,6 +922,7 @@ def comp_cfg(shared, competition):
     """Build a single-competition cfg (the shape the Competition class expects)."""
     c = dict(shared)
     c["comp"] = competition.get("comp", "")
+    c["practice"] = bool(competition.get("practice", False))
     c["levels"] = competition.get("levels", [])
     return c
 
@@ -981,6 +1008,21 @@ def run_gui(cfg, conf_dir):
     reset_btn.pack(side="right", padx=(6, 0))
     reload_btn = ttk.Button(compbar, text="Reload")  # command wired below
     reload_btn.pack(side="right")
+
+    # practice-only controls (shown by select_comp when the chosen competition is practice):
+    # an "Unlock all levels" toggle + a level picker so the student can jump around freely.
+    practicebar = ttk.Frame(root, padding=(10, 0, 10, 2))
+    free_switch_var = tk.BooleanVar(value=False)
+    LEVELPICK = {}  # label -> level number
+    practice_chk = ttk.Checkbutton(practicebar, text="Unlock all levels (practice)",
+                                   variable=free_switch_var)  # command wired below
+    practice_chk.pack(side="left")
+    ttk.Label(practicebar, text="   Jump to level:").pack(side="left")
+    level_pick_var = tk.StringVar()
+    level_combo = ttk.Combobox(practicebar, textvariable=level_pick_var, state="disabled", width=22)
+    level_combo.pack(side="left", padx=6)
+    goto_btn = ttk.Button(practicebar, text="Go", state="disabled")  # command wired below
+    goto_btn.pack(side="left")
 
     frm = ttk.Frame(root, padding=10)
     frm.pack(fill="both", expand=True)
@@ -1071,6 +1113,7 @@ def run_gui(cfg, conf_dir):
         if cur is None or cur.team != team_id or cur.comp != ccfg.get("comp", ""):
             save_state(conf_dir, {"team_id": team_id})
             comp["obj"] = Competition(ccfg, team_id, lambda k, p: msgq.put((k, p)), cancel)
+        comp["obj"].free_switch = bool(ccfg.get("practice")) and free_switch_var.get()
         return comp["obj"]
 
     # enabled buttons per state: (start, resume, stop, checkpoint, start-over, finish)
@@ -1183,6 +1226,32 @@ def run_gui(cfg, conf_dir):
         logln("Reset for a new student (Packet Tracer registration kept — no first-time setup needed).")
         status_var.set("Ready for a new student: enter Team ID, pick your competition, and Start.")
 
+    def on_free_toggle():
+        on = free_switch_var.get()
+        try:
+            level_combo.configure(state=("readonly" if on else "disabled"))
+            goto_btn.configure(state=("normal" if on else "disabled"))
+        except Exception:
+            pass
+        if comp["obj"]:
+            comp["obj"].free_switch = on
+        if on:
+            status_var.set("Practice: levels unlocked — pick a level and click Go to jump.")
+
+    def do_goto_level():
+        c = comp["obj"]
+        if not c or ui_state["v"] != "running":
+            status_var.set("Click Start first, then you can jump between levels.")
+            return
+        n = LEVELPICK.get(level_pick_var.get())
+        if not n:
+            return
+        logln(f"Jumping to level {n} (practice)…")
+        run_action(lambda: c.switch_level(n), f"Switching to level {n}…")
+
+    practice_chk.configure(command=on_free_toggle)
+    goto_btn.configure(command=do_goto_level)
+
     # control buttons laid out in a 3-column grid so none get clipped on a small window
     btnbar = ttk.Frame(frm)
     btnbar.grid(row=2, column=0, columnspan=3, sticky="we", pady=6)
@@ -1209,8 +1278,26 @@ def run_gui(cfg, conf_dir):
         c = ENR["by_name"].get(sel_var.get())
         if not c:
             rebuild_cards([])
+            practicebar.pack_forget()
             return
         rebuild_cards(c.get("levels", []))
+        if c.get("practice"):
+            LEVELPICK.clear()
+            labels = []
+            for lc in c.get("levels", []):
+                n = int(lc["level"])
+                lab = lc.get("name") or f"Level {n}"
+                LEVELPICK[lab] = n
+                labels.append(lab)
+            level_combo.configure(values=labels)
+            if labels:
+                level_pick_var.set(labels[0])
+            free_switch_var.set(True)   # practice defaults to unlocked / free switching
+            practicebar.pack(fill="x", after=compbar)
+            on_free_toggle()
+        else:
+            free_switch_var.set(False)
+            practicebar.pack_forget()
         nm = c.get("name") or c.get("comp")
         status_var.set(f"Selected “{nm}”. Enter your Team ID and click Start.")
 
@@ -1307,7 +1394,12 @@ def run_gui(cfg, conf_dir):
     if os.environ.get("PT_AGENT_SELFTEST"):
         demo = [{"level": 1, "image": "x", "threshold": 100}, {"level": 2, "image": "y", "threshold": 100}]
         apply_enrollment(dict(cfg), [{"comp": "demo", "name": "Demo competition", "levels": demo},
-                                     {"comp": "demo2", "name": "Another competition", "levels": demo}], "demo")
+                                     {"comp": "demo2", "name": "Practice competition", "practice": True, "levels": demo}], "demo")
+        if os.environ.get("PT_AGENT_SELFTEST_PRACTICE"):
+            sel_var.set("Practice competition")   # exercise the practice controls path
+            select_comp()
+            print("[practice] practicebar mapped:", bool(practicebar.winfo_manager()),
+                  "level choices:", list(LEVELPICK.keys()), "free_switch:", free_switch_var.get())
         render_cards({"levels": [{"level": 1, "unlocked": True, "cleared": True},
                                  {"level": 2, "unlocked": True, "cleared": False}], "active": 2, "pct": 42})
         if os.environ.get("PT_AGENT_GEOCHECK"):
@@ -1355,6 +1447,142 @@ def run_cli(cfg, conf_dir, team_id, once, comp_id=None):
         comp.stop()
 
 
+# ---------------- auto-update (frozen builds only) ----------------
+def _ver_tuple(v):
+    out = []
+    for part in str(v).split("."):
+        num = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(num) if num else 0)
+    return tuple(out)
+
+
+def _platform_key():
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def _spawn_updater(new_path, target_path):
+    """Replace target_path with new_path once this process exits, then relaunch it."""
+    pid = os.getpid()
+    if sys.platform.startswith("win"):
+        bat = new_path + ".update.bat"
+        # wait for this PID to exit, then swap the exe and relaunch; retries while locked
+        script = (
+            "@echo off\r\n"
+            ":wait\r\n"
+            f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul 2>&1 && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n'
+            ":swap\r\n"
+            f'move /Y "{new_path}" "{target_path}" >nul 2>&1 || (ping -n 2 127.0.0.1 >nul & goto swap)\r\n'
+            f'start "" "{target_path}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        with open(bat, "w") as f:
+            f.write(script)
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x00000008)  # DETACHED_PROCESS
+    else:
+        sh = new_path + ".update.sh"
+        script = (
+            "#!/bin/sh\n"
+            f"while kill -0 {pid} 2>/dev/null; do sleep 0.5; done\n"
+            f'mv -f "{new_path}" "{target_path}"\n'
+            f'chmod +x "{target_path}"\n'
+            f'"{target_path}" &\n'
+            'rm -- "$0"\n'
+        )
+        with open(sh, "w") as f:
+            f.write(script)
+        os.chmod(sh, 0o755)
+        subprocess.Popen(["sh", sh], start_new_session=True)
+
+
+def _update_available(cfg):
+    """Quick, silent check: return the platform to update to if the server has a newer build
+    for this (frozen) agent, else None. No download, no UI."""
+    if not getattr(sys, "frozen", False) or not cfg.get("auto_update", True):
+        return None
+    base = (cfg.get("levelsvc") or "").rstrip("/")
+    token = cfg.get("class_token")
+    if not base or not token:
+        return None
+    try:
+        req = urllib.request.Request(base + "/agent/latest", headers={"X-Class-Token": token})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            info = json.loads(r.read().decode())
+    except Exception:
+        return None
+    srv_ver = info.get("version") or ""
+    plat = _platform_key()
+    if not srv_ver or plat not in (info.get("platforms") or []):
+        return None
+    if _ver_tuple(srv_ver) <= _ver_tuple(AGENT_VERSION):
+        return None
+    return plat
+
+
+def _download_and_stage(cfg, plat):
+    """Download the new build, stage it, and spawn the updater. Returns True on success."""
+    base = (cfg.get("levelsvc") or "").rstrip("/")
+    token = cfg.get("class_token")
+    target = os.path.abspath(sys.executable)
+    new_path = target + ".new"
+    try:
+        url = base + "/agent/file?platform=" + urllib.parse.quote(plat)
+        req = urllib.request.Request(url, headers={"X-Class-Token": token})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            data = r.read()
+        if len(data) < 100 * 1024:  # sanity: a real build is never this small
+            return False
+        with open(new_path, "wb") as f:
+            f.write(data)
+        _spawn_updater(new_path, target)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(new_path):
+                os.remove(new_path)
+        except Exception:
+            pass
+        return False
+
+
+def _update_with_splash(cfg):
+    """If an update is available, show a tiny 'Updating…' window while downloading, then
+    hand off to the updater. Returns True if an update was applied (caller should exit)."""
+    plat = _update_available(cfg)
+    if not plat:
+        return False
+    try:
+        import tkinter as tk
+    except Exception:
+        return _download_and_stage(cfg, plat)
+    root = tk.Tk()
+    root.title("Updating")
+    root.geometry("340x100")
+    try:
+        root.resizable(False, False)
+    except Exception:
+        pass
+    tk.Label(root, text="Updating the Packet Tracer agent…\nIt will restart automatically.",
+             padx=20, pady=24, justify="center").pack(expand=True)
+    result = {"ok": False}
+
+    def work():
+        result["ok"] = _download_and_stage(cfg, plat)
+        try:
+            root.after(0, root.destroy)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    try:
+        root.mainloop()
+    except Exception:
+        pass
+    return result["ok"]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Packet Tracer competition agent (levels)")
     ap.add_argument("-c", "--config", default=CONF_DEFAULT)
@@ -1374,6 +1602,9 @@ def main():
     if args.cli or args.once:
         run_cli(cfg, conf_dir, args.team, args.once, args.comp)
     else:
+        # self-update before the main window opens; if it updates, exit so the updater can swap us
+        if _update_with_splash(cfg):
+            return
         run_gui(cfg, conf_dir)
 
 

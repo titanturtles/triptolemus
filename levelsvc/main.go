@@ -101,25 +101,23 @@ func tomlStr(line, key string) string {
 	return ""
 }
 
-// loadTeamAliases parses sarpedon.conf [[team]] blocks into a map of lowercased
-// id-or-alias -> canonical team id, so the allow-list can use either form.
-func loadTeamAliases(sarpConf string) map[string]string {
-	m := map[string]string{}
+type teamRec struct{ ID, Alias string }
+
+// parseTeams parses sarpedon.conf [[team]] blocks into {id, alias} records.
+func parseTeams(sarpConf string) []teamRec {
+	recs := []teamRec{}
 	if sarpConf == "" {
-		return m
+		return recs
 	}
 	data, err := os.ReadFile(sarpConf)
 	if err != nil {
-		return m
+		return recs
 	}
 	var id, alias string
 	inTeam := false
 	flush := func() {
 		if id != "" {
-			m[strings.ToLower(id)] = id
-			if alias != "" {
-				m[strings.ToLower(alias)] = id
-			}
+			recs = append(recs, teamRec{id, alias})
 		}
 		id, alias = "", ""
 	}
@@ -146,7 +144,53 @@ func loadTeamAliases(sarpConf string) map[string]string {
 		}
 	}
 	flush()
+	return recs
+}
+
+// loadTeamAliases maps lowercased id-or-alias -> canonical team id (for the allow-list).
+func loadTeamAliases(sarpConf string) map[string]string {
+	m := map[string]string{}
+	for _, r := range parseTeams(sarpConf) {
+		m[strings.ToLower(r.ID)] = r.ID
+		if r.Alias != "" {
+			m[strings.ToLower(r.Alias)] = r.ID
+		}
+	}
 	return m
+}
+
+// aliasForID returns a team's alias (by id or alias, case-insensitive), or the input itself
+// if the team has no alias / isn't found. Used so stored files are named by the public alias.
+func aliasForID(sarpConf, team string) string {
+	for _, r := range parseTeams(sarpConf) {
+		if strings.EqualFold(r.ID, team) || strings.EqualFold(r.Alias, team) {
+			if r.Alias != "" {
+				return r.Alias
+			}
+			return r.ID
+		}
+	}
+	return team
+}
+
+// safeFilePart keeps only filename-safe characters (others -> '-').
+func safeFilePart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '-' || r == '_' || r == '.' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// storageKey is the alias-based, filename-safe key a team's review/progress files are stored
+// under, so the team id (treated as a secret) never appears in a filename.
+func storageKey(sarpConf, team string) string {
+	return safeFilePart(aliasForID(sarpConf, team))
 }
 
 // canonicalTeam resolves a team id or alias to its canonical id (unknown values pass through).
@@ -216,6 +260,7 @@ type Config struct {
 	Remote       string        `json:"remote"`   // sarpedon base URL students POST scores to
 	PtAppID      string        `json:"ptAppId"`  // shared ExApp id (same for all competitions)
 	PtSecret     string        `json:"ptSecret"` // shared ExApp secret
+	AgentDir     string        `json:"agentDir"` // where published pt_agent builds live (auto-update)
 	Competitions []Competition `json:"competitions"`
 	Levels       []Level       `json:"levels,omitempty"` // legacy single-competition; migrated on load
 }
@@ -283,14 +328,14 @@ type levelStatus struct {
 	Unlocked  bool   `json:"unlocked"`
 }
 
-func computeStatus(team string, levels []Level) (int, []levelStatus) {
+func computeStatus(team string, levels []Level, practice bool) (int, []levelStatus) {
 	out := make([]levelStatus, 0, len(levels))
 	maxUnlocked := 0
 	prevCleared := true
 	for _, l := range levels {
 		score := maxPoints(team, l.Image)
 		cleared := score >= l.Threshold
-		unlocked := prevCleared
+		unlocked := practice || prevCleared // practice competitions have no lock
 		if unlocked && l.Level > maxUnlocked {
 			maxUnlocked = l.Level
 		}
@@ -324,9 +369,9 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 			"hidden": true, "unlocked": 0, "levels": []levelStatus{}})
 		return
 	}
-	unlocked, levels := computeStatus(team, cp.Levels)
+	unlocked, levels := computeStatus(team, cp.Levels, cp.Practice)
 	writeJSON(w, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "team": team,
-		"unlocked": unlocked, "levels": levels})
+		"practice": cp.Practice, "unlocked": unlocked, "levels": levels})
 }
 
 func levelHandler(w http.ResponseWriter, r *http.Request) {
@@ -357,7 +402,7 @@ func levelHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such level", 404)
 		return
 	}
-	_, levels := computeStatus(team, cp.Levels)
+	_, levels := computeStatus(team, cp.Levels, cp.Practice)
 	for _, ls := range levels {
 		if ls.Level == n && !ls.Unlocked {
 			http.Error(w, "level locked: clear the previous level first", 403)
@@ -405,7 +450,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := filepath.Join(c.UploadDir, cp.ID)
 	os.MkdirAll(dir, 0750)
-	name := fmt.Sprintf("%s_L%s_%s.pka", filepath.Base(team), filepath.Base(n), time.Now().UTC().Format("20060102-150405"))
+	name := fmt.Sprintf("%s_L%s_%s.pka", storageKey(c.SarpConf, team), filepath.Base(n), time.Now().UTC().Format("20060102-150405"))
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0640); err != nil {
 		http.Error(w, "server write error", 500)
 		return
@@ -431,7 +476,7 @@ func progressHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := filepath.Join(c.ProgressDir, cp.ID)
-	path := filepath.Join(dir, fmt.Sprintf("%s_L%s.pka", filepath.Base(team), filepath.Base(n)))
+	path := filepath.Join(dir, fmt.Sprintf("%s_L%s.pka", storageKey(c.SarpConf, team), filepath.Base(n)))
 	if r.Method == http.MethodPost {
 		limit := c.MaxUpload
 		if limit <= 0 {
@@ -940,7 +985,9 @@ func adminRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	dstDir := filepath.Join(c.ProgressDir, comp)
 	os.MkdirAll(dstDir, 0750)
-	dst := filepath.Join(dstDir, fmt.Sprintf("%s_L%s.pka", filepath.Base(team), filepath.Base(n)))
+	// team may arrive as an alias (parsed from an alias-named file) or an id; resolve to the
+	// same alias key the student's resume will look up.
+	dst := filepath.Join(dstDir, fmt.Sprintf("%s_L%s.pka", storageKey(c.SarpConf, team), filepath.Base(n)))
 	if err := os.WriteFile(dst, data, 0640); err != nil {
 		http.Error(w, "server write error", 500)
 		return
@@ -1227,6 +1274,156 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 
 // adminAgentConfig returns a competition's per-level key + hash so the manager can
 // rebuild pt_agent.conf.json from the server (without local manifests).
+// ---------------- agent auto-update ----------------
+
+type agentManifest struct {
+	Version string            `json:"version"`
+	Files   map[string]string `json:"files"` // platform -> stored filename
+}
+
+func classOK(r *http.Request, c Config) bool {
+	tok := r.Header.Get("X-Class-Token")
+	if tok == "" {
+		tok = r.URL.Query().Get("token")
+	}
+	return c.ClassToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(c.ClassToken)) == 1
+}
+
+func agentDir(c Config) string {
+	if c.AgentDir != "" {
+		return c.AgentDir
+	}
+	if c.UploadDir != "" {
+		return filepath.Join(filepath.Dir(c.UploadDir), "agent")
+	}
+	return "agent"
+}
+
+func agentFilename(platform string) string {
+	switch platform {
+	case "windows":
+		return "pt_agent_windows.exe"
+	case "macos", "darwin":
+		return "pt_agent_macos"
+	default:
+		return "pt_agent_linux"
+	}
+}
+
+func readAgentManifest(dir string) agentManifest {
+	m := agentManifest{Files: map[string]string{}}
+	data, err := os.ReadFile(filepath.Join(dir, "agent.json"))
+	if err == nil {
+		_ = json.Unmarshal(data, &m)
+	}
+	if m.Files == nil {
+		m.Files = map[string]string{}
+	}
+	return m
+}
+
+func writeAgentManifest(dir string, m agentManifest) error {
+	data, _ := json.MarshalIndent(m, "", "  ")
+	return os.WriteFile(filepath.Join(dir, "agent.json"), data, 0644)
+}
+
+// GET /agent/latest (class-token gated): the current published version + platforms.
+func agentLatest(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	c := snapshot()
+	if !classOK(r, c) && !admin(r) { // students use the class token; the console uses the admin token
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	m := readAgentManifest(agentDir(c))
+	plats := []string{}
+	for p := range m.Files {
+		plats = append(plats, p)
+	}
+	writeJSON(w, map[string]interface{}{"version": m.Version, "platforms": plats})
+}
+
+// GET /agent/file?platform=P (class-token gated): download the published binary for P.
+func agentFile(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	c := snapshot()
+	if !classOK(r, c) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	plat := r.URL.Query().Get("platform")
+	m := readAgentManifest(agentDir(c))
+	fn := m.Files[plat]
+	if fn == "" {
+		http.Error(w, "no build for platform", 404)
+		return
+	}
+	f, err := os.Open(filepath.Join(agentDir(c), filepath.Base(fn)))
+	if err != nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filepath.Base(fn)))
+	io.Copy(w, f)
+}
+
+// POST /admin/agentpublish?platform=P&version=V (admin, multipart field "binary"): publish a build.
+func adminAgentPublish(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if !admin(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(256 << 20); err != nil {
+		http.Error(w, "bad multipart form: "+err.Error(), 400)
+		return
+	}
+	plat := r.FormValue("platform")
+	ver := strings.TrimSpace(r.FormValue("version"))
+	if plat == "" || ver == "" {
+		http.Error(w, "platform and version required", 400)
+		return
+	}
+	fhs := r.MultipartForm.File["binary"]
+	if len(fhs) == 0 {
+		http.Error(w, "binary file required", 400)
+		return
+	}
+	c := snapshot()
+	dir := agentDir(c)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		http.Error(w, "cannot create agent dir: "+err.Error(), 500)
+		return
+	}
+	f, err := fhs[0].Open()
+	if err != nil {
+		http.Error(w, "cannot read uploaded binary", 400)
+		return
+	}
+	data, _ := io.ReadAll(f)
+	f.Close()
+	fn := agentFilename(plat)
+	if err := os.WriteFile(filepath.Join(dir, fn), data, 0755); err != nil {
+		http.Error(w, "cannot store binary: "+err.Error(), 500)
+		return
+	}
+	m := readAgentManifest(dir)
+	m.Version = ver
+	m.Files[plat] = fn
+	if err := writeAgentManifest(dir, m); err != nil {
+		http.Error(w, "cannot write manifest: "+err.Error(), 500)
+		return
+	}
+	log.Printf("agent publish: version=%s platform=%s bytes=%d", ver, plat, len(data))
+	writeJSON(w, map[string]interface{}{"status": "OK", "version": ver, "platform": plat, "bytes": len(data)})
+}
+
 func adminAgentConfig(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	if !admin(r) {
@@ -1281,7 +1478,7 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 				"password": l.Password, "pt_password": l.PtPassword,
 			})
 		}
-		comps = append(comps, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "levels": levels})
+		comps = append(comps, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "practice": cp.Practice, "levels": levels})
 	}
 	if def == "" && len(comps) > 0 {
 		def = comps[0]["comp"].(string) // fall back to the first visible competition
@@ -1335,7 +1532,7 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, l := range cp.Levels {
-		os.Remove(filepath.Join(c.ProgressDir, cp.ID, fmt.Sprintf("%s_L%d.pka", filepath.Base(team), l.Level)))
+		os.Remove(filepath.Join(c.ProgressDir, cp.ID, fmt.Sprintf("%s_L%d.pka", storageKey(c.SarpConf, team), l.Level)))
 	}
 	log.Printf("reset comp=%s team=%s: deleted %d score(s) + progress", cp.ID, team, deleted)
 	writeJSON(w, map[string]interface{}{"status": "OK", "deleted": deleted})
@@ -1430,6 +1627,9 @@ func main() {
 	http.HandleFunc("/progress", progressHandler)
 	http.HandleFunc("/enroll", enrollHandler)
 	http.HandleFunc("/reset", resetHandler)
+	http.HandleFunc("/agent/latest", agentLatest)
+	http.HandleFunc("/agent/file", agentFile)
+	http.HandleFunc("/admin/agentpublish", adminAgentPublish)
 	http.HandleFunc("/admin/competitions", adminCompetitions)
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)
