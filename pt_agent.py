@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.1"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.2"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1468,38 +1468,72 @@ def _platform_key():
     return "linux"
 
 
+def _relaunch_env():
+    """Environment for starting a fresh copy of ourselves. A PyInstaller one-file build passes
+    _PYI_* variables to its children; a relaunched copy that inherits them thinks it's a child,
+    looks for the old (already deleted) unpack folder, and dies. Strip them and ask the
+    bootloader to start clean."""
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("_PYI") or k.startswith("_MEIPASS"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def _spawn_updater(new_path, target_path):
-    """Replace target_path with new_path once this process exits, then relaunch it."""
+    """Replace target_path with new_path once this process exits, then relaunch it.
+    Progress goes to pt_agent.update.log next to the app."""
     pid = os.getpid()
+    log = os.path.join(os.path.dirname(target_path), "pt_agent.update.log")
     if sys.platform.startswith("win"):
         bat = new_path + ".update.bat"
-        # wait for this PID to exit, then swap the exe and relaunch; retries while locked
+        # wait for this PID, then swap (retrying ~60s while the exe is still locked) and relaunch;
+        # if the swap never succeeds, drop the download and relaunch the old version
         script = (
             "@echo off\r\n"
+            f'echo waiting for {pid} > "{log}"\r\n'
             ":wait\r\n"
             f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul 2>&1 && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n'
+            "set /a tries=0\r\n"
             ":swap\r\n"
-            f'move /Y "{new_path}" "{target_path}" >nul 2>&1 || (ping -n 2 127.0.0.1 >nul & goto swap)\r\n'
+            f'move /Y "{new_path}" "{target_path}" >nul 2>&1 && goto moved\r\n'
+            "set /a tries+=1\r\n"
+            "if %tries% GEQ 60 goto giveup\r\n"
+            "ping -n 2 127.0.0.1 >nul\r\n"
+            "goto swap\r\n"
+            ":giveup\r\n"
+            f'echo swap failed, keeping the old version >> "{log}"\r\n'
+            f'del "{new_path}" >nul 2>&1\r\n'
+            "goto launch\r\n"
+            ":moved\r\n"
+            f'echo swapped >> "{log}"\r\n'
+            ":launch\r\n"
             f'start "" "{target_path}"\r\n'
+            f'echo relaunched >> "{log}"\r\n'
             'del "%~f0"\r\n'
         )
         with open(bat, "w") as f:
             f.write(script)
-        subprocess.Popen(["cmd", "/c", bat], creationflags=0x00000008)  # DETACHED_PROCESS
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x00000008,  # DETACHED_PROCESS
+                         env=_relaunch_env())
     else:
         sh = new_path + ".update.sh"
         script = (
             "#!/bin/sh\n"
+            f'echo "$(date) waiting for {pid}" > "{log}"\n'
             f"while kill -0 {pid} 2>/dev/null; do sleep 0.5; done\n"
-            f'mv -f "{new_path}" "{target_path}"\n'
-            f'chmod +x "{target_path}"\n'
-            f'"{target_path}" &\n'
+            f'if mv -f "{new_path}" "{target_path}" >>"{log}" 2>&1; then\n'
+            f'  chmod +x "{target_path}"; echo "$(date) swapped" >>"{log}"\n'
+            "else\n"
+            f'  echo "$(date) swap failed, keeping the old version" >>"{log}"; rm -f "{new_path}"\n'
+            "fi\n"
+            f'"{target_path}" >>"{log}" 2>&1 &\n'
+            f'echo "$(date) relaunched" >>"{log}"\n'
             'rm -- "$0"\n'
         )
         with open(sh, "w") as f:
             f.write(script)
         os.chmod(sh, 0o755)
-        subprocess.Popen(["sh", sh], start_new_session=True)
+        subprocess.Popen(["sh", sh], start_new_session=True, env=_relaunch_env())
 
 
 def _update_available(cfg):
