@@ -243,16 +243,31 @@ class PTMPClient:
         """appWindow().getActiveFile().<method>(args...)"""
         return self.call(("appWindow",), ("getActiveFile",), (method,) + args)
 
-    # --- file control (appWindow level) ---
+    def _slow_call(self, secs, *steps):
+        """Run a call that PT answers slowly (opening/saving a .pka can take far longer than
+        the default 6s socket timeout on a loaded VM). Widens the socket timeout just for it."""
+        old = self.sock.gettimeout() if self.sock else None
+        try:
+            if self.sock:
+                self.sock.settimeout(secs)
+            return self.call(*steps)
+        finally:
+            if self.sock and old is not None:
+                try:
+                    self.sock.settimeout(old)
+                except Exception:
+                    pass
+
+    # --- file control (appWindow level; PT can take a while, so use a long timeout) ---
     def file_open(self, path):
-        r = self.call(("appWindow",), ("fileOpen", path))
+        r = self._slow_call(180, ("appWindow",), ("fileOpen", path))
         return int(r) if r is not None else -1
 
     def file_save_as(self, path):
-        return self.call(("appWindow",), ("fileSaveAsNoPrompt", path, False))
+        return self._slow_call(300, ("appWindow",), ("fileSaveAsNoPrompt", path, False))
 
     def file_new(self):
-        return self.call(("appWindow",), ("fileNew", False))
+        return self._slow_call(60, ("appWindow",), ("fileNew", False))
 
     def read_activity(self, pt_password=None):
         """Returns (title, percent, items_done, items_total) for the open activity."""
