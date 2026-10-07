@@ -19,13 +19,16 @@ if not defined PY (
 )
 echo Using Python: %PY%
 
+for /f "usebackq tokens=2 delims== " %%V in (`findstr /b /c:"AGENT_VERSION" pt_agent.py`) do set "AGENTVER=%%~V"
+echo Building pt_agent version %AGENTVER%  (publish this version on the console's App update page)
+
 %PY% -m pip install --upgrade pyinstaller cryptography || ( echo ERROR: pip install failed & exit /b 1 )
 %PY% -m PyInstaller --onefile --windowed --name pt_agent --clean --noconfirm pt_agent.py || ( echo ERROR: pt_agent build failed & exit /b 1 )
 %PY% -m PyInstaller --onefile --windowed --name scoreboard_manager --clean --noconfirm scoreboard_manager.py || ( echo ERROR: scoreboard_manager build failed & exit /b 1 )
 
 if exist "dist\pt_agent.exe" (
   echo(
-  echo Built:  dist\pt_agent.exe   dist\scoreboard_manager.exe
+  echo Built:  dist\pt_agent.exe  (version %AGENTVER%)   dist\scoreboard_manager.exe
   echo Students:     ship pt_agent.exe + pt_agent.conf.json + ptagent.pta in one folder.
   echo Test creator: ship scoreboard_manager.exe + the pka_tool\ folder in one folder.
 ) else (

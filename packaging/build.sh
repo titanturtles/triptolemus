@@ -12,10 +12,13 @@ if ! python3 -c "import PyInstaller" 2>/dev/null; then
   exit 1
 fi
 
+VER="$(sed -n 's/^AGENT_VERSION *= *"\([^"]*\)".*/\1/p' pt_agent.py)"
+echo "Building pt_agent version ${VER:-?}  (publish this version on the console's App update page)"
+
 pyinstaller --onefile --windowed --name pt_agent --clean --noconfirm pt_agent.py
 pyinstaller --onefile --windowed --name scoreboard_manager --clean --noconfirm scoreboard_manager.py
 
 echo
-echo "Built:  dist/pt_agent   dist/scoreboard_manager"
+echo "Built:  dist/pt_agent (version ${VER:-?})   dist/scoreboard_manager"
 echo "Students:     ship 'pt_agent' + 'pt_agent.conf.json' in one folder."
 echo "Test creator: ship 'scoreboard_manager' + the 'pka_tool/' folder in one folder."

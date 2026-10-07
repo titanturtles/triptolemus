@@ -1587,7 +1587,24 @@ def _update_with_splash(cfg):
     return result["ok"]
 
 
+def _attach_parent_console():
+    """Windowed (GUI) Windows exes have no console, so stdout from --version/--help/--cli
+    goes nowhere. Attach to the launching console so those flags print as expected."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.AttachConsole(-1):  # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w")
+            sys.stderr = open("CONOUT$", "w")
+    except Exception:
+        pass
+
+
 def main():
+    # make console output (version/help/cli) visible when launched from a terminal on Windows
+    if any(a in ("--version", "-h", "--help", "--cli", "--once") for a in sys.argv[1:]):
+        _attach_parent_console()
     ap = argparse.ArgumentParser(description="Packet Tracer competition agent (levels)")
     ap.add_argument("--version", action="version", version=f"pt_agent {AGENT_VERSION}")
     ap.add_argument("-c", "--config", default=CONF_DEFAULT)
