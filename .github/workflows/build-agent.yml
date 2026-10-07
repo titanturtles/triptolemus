@@ -22,6 +22,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -60,12 +61,15 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Python + Tk + build deps
+        timeout-minutes: 8   # a hung package mirror once stalled this step indefinitely
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-venv python3-tk
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          sudo apt-get $APT update
+          sudo apt-get $APT install -y python3 python3-venv python3-tk
           python3 -m venv --system-site-packages .venv
           . .venv/bin/activate
           pip install --upgrade pip pyinstaller cryptography
@@ -104,6 +108,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [windows, linux]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
