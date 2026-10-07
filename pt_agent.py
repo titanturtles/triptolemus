@@ -676,6 +676,9 @@ class Competition:
 
             # a level just cleared -> advance to the newly-unlocked one (fresh copy)
             if active and active["level"] != self.current:
+                # save + upload the level that just cleared so every level is reviewable,
+                # not just the last one the student finishes on
+                self._save(progress=True, final=True)
                 try:
                     with self.io_lock:
                         self.client.file_new()
