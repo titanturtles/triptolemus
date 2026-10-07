@@ -155,6 +155,16 @@ class PTMPClient:
                 if self._reached:
                     raise
                 last = e
+            except OSError:
+                # TCP connected but PT didn't answer the handshake in time (still loading,
+                # or a modal dialog is open). Don't scan other ports — report clearly.
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+                raise PTMPError("Packet Tracer accepted the connection but didn't respond in time "
+                                "(it may still be loading). Wait until it finishes opening, then click Start again.")
         raise PTMPError(f"Packet Tracer not reachable on {self.host}:{self.ports[0]}-{self.ports[-1]} ({last})")
 
     def _handshake(self):
@@ -550,30 +560,55 @@ class Competition:
         return None
 
     def _connect(self):
-        """Connect to Packet Tracer; if it isn't running, launch it and wait."""
-        try:
+        """Connect to Packet Tracer; if it isn't running, launch it and wait. PT often accepts
+        the IPC port a moment before it can answer PTMP, so the handshake is retried briefly."""
+        def try_connect():
             return PTMPClient(self.cfg["pt_app_id"], self.cfg["pt_secret"]).connect()
+
+        # "not responding" = PT is up but didn't finish the handshake in time (worth retrying);
+        # "not reachable" = no IPC port open yet (launch PT if allowed).
+        not_ready = lambda m: ("didn't respond" in m) or ("not reachable" in m)
+
+        try:
+            return try_connect()
         except PTMPError as e:
-            if "not reachable" not in str(e) or not self.cfg.get("auto_launch", True):
-                raise  # reached PT (e.g. auth failed), or auto-launch disabled
-            cmd = find_pt_command(self.cfg)
-            if not cmd:
-                raise  # can't find Packet Tracer -> upstream shows install message
-            self.report("log", "Packet Tracer isn't running — launching it…")
-            self.report("status", "Launching Packet Tracer…")
-            try:
-                launch_pt(cmd)
-            except Exception as le:
-                self.report("log", "Could not launch Packet Tracer: " + str(le))
-                raise e
-            for i in range(90):  # wait up to ~3 min (PT startup + any NetAcad login)
+            if not not_ready(str(e)):
+                raise  # auth rejected etc. — a retry won't help
+            if "not reachable" in str(e) and self.cfg.get("auto_launch", True):
+                cmd = find_pt_command(self.cfg)
+                if not cmd:
+                    raise  # can't find Packet Tracer -> upstream shows install message
+                self.report("log", "Packet Tracer isn't running — launching it…")
+                self.report("status", "Launching Packet Tracer…")
+                try:
+                    launch_pt(cmd)
+                except Exception as le:
+                    self.report("log", "Could not launch Packet Tracer: " + str(le))
+                    raise e
+                for i in range(90):  # wait up to ~3 min (PT startup + any NetAcad login)
+                    if self.cancel.is_set():
+                        raise PTMPError("cancelled")
+                    if pt_port_open():
+                        break
+                    self.report("status", f"Waiting for Packet Tracer to start… (log in if prompted) — {i * 2}s")
+                    self.cancel.wait(2)
+            elif "not reachable" in str(e):
+                raise  # auto-launch disabled and PT isn't up
+            # Port is (now) open; PT may still need a few seconds to answer PTMP — retry.
+            last = e
+            for _ in range(8):  # ~24s of grace after the port opens
                 if self.cancel.is_set():
                     raise PTMPError("cancelled")
-                if pt_port_open():
-                    break
-                self.report("status", f"Waiting for Packet Tracer to start… (log in if prompted) — {i * 2}s")
-                self.cancel.wait(2)
-            return PTMPClient(self.cfg["pt_app_id"], self.cfg["pt_secret"]).connect()
+                self.cancel.wait(3)
+                try:
+                    return try_connect()
+                except PTMPError as e2:
+                    last = e2
+                    if not_ready(str(e2)):
+                        self.report("status", "Packet Tracer is finishing startup — connecting…")
+                        continue
+                    raise  # a definite error (e.g. auth rejected)
+            raise last
 
     def _active_level(self):
         """Return (level_number, levels) for the level the student should be on now."""
