@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.5"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.6"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1122,14 +1122,26 @@ def _firefox_profile_dirs():
 
 
 def _query_sqlite_copy(src, sql, params):
-    """Copy a (possibly locked) sqlite DB to a temp file and run one query. Returns rows or []."""
+    """Copy a (possibly locked) sqlite DB to a temp file and run one query. Returns rows or [].
+    The -wal and -shm sidecars are copied too: while the browser is open, recent history sits in
+    the write-ahead log and is not yet in the main file, so copying the main file alone misses it.
+    SQLite replays the copied WAL on open."""
     import sqlite3
     tmp = None
+    extra = []
     try:
         fd, tmp = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
         shutil.copy2(src, tmp)
-        con = sqlite3.connect(tmp)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(src + suffix):
+                try:
+                    shutil.copy2(src + suffix, tmp + suffix)
+                    extra.append(tmp + suffix)
+                except Exception:
+                    pass
+        # read-only but still applying the WAL copy; a short busy timeout in case of contention
+        con = sqlite3.connect(tmp, timeout=5)
         try:
             return list(con.execute(sql, params))
         finally:
@@ -1137,9 +1149,9 @@ def _query_sqlite_copy(src, sql, params):
     except Exception:
         return []
     finally:
-        if tmp:
+        for p in [tmp] + extra if tmp else []:
             try:
-                os.remove(tmp)
+                os.remove(p)
             except Exception:
                 pass
 
@@ -1221,13 +1233,83 @@ def _ai_dns_cache():
     return [(svc, dom) for dom, svc in hits.items()]
 
 
+def _clipboard_texts():
+    """(texts, method): the current clipboard (and, on X11, the highlighted PRIMARY selection).
+    Copying the task description to paste into an AI lands here. Best-effort, no hard deps."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            CF_UNICODETEXT = 13
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            u.OpenClipboard.argtypes = [wintypes.HWND]
+            u.GetClipboardData.restype = wintypes.HANDLE
+            u.GetClipboardData.argtypes = [wintypes.UINT]
+            k.GlobalLock.restype = wintypes.LPVOID
+            k.GlobalLock.argtypes = [wintypes.HANDLE]
+            k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+            if not u.OpenClipboard(None):
+                return [], "unavailable"
+            try:
+                h = u.GetClipboardData(CF_UNICODETEXT)
+                if not h:
+                    return [], "ok"
+                p = k.GlobalLock(h)
+                if not p:
+                    return [], "ok"
+                try:
+                    return [ctypes.c_wchar_p(p).value or ""], "ok"
+                finally:
+                    k.GlobalUnlock(h)
+            finally:
+                u.CloseClipboard()
+        except Exception:
+            return [], "unavailable"
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
+            return ([out.stdout] if out.returncode == 0 else []), "pbpaste"
+        except Exception:
+            return [], "unavailable"
+    # X11: read the clipboard and the primary (highlighted) selection via xclip or xsel
+    texts, method = [], "unavailable"
+    try:
+        if shutil.which("xclip"):
+            method = "xclip"
+            for sel in ("clipboard", "primary"):
+                r = subprocess.run(["xclip", "-selection", sel, "-o"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout:
+                    texts.append(r.stdout)
+        elif shutil.which("xsel"):
+            method = "xsel"
+            for flag in ("-b", "-p"):
+                r = subprocess.run(["xsel", flag, "-o"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout:
+                    texts.append(r.stdout)
+    except Exception:
+        pass
+    return texts, method
+
+
+def _looks_like_description(t):
+    """A large block of prose (the task description), not a single command, IP or password."""
+    t = (t or "").strip()
+    return len(t) >= 160 and t.count(" ") >= 20 and sum(c.isalpha() for c in t) >= len(t) * 0.5
+
+
+def _clip_snippet(t):
+    return " ".join((t or "").split())[:160]
+
+
 class AIWatcher:
     """Runs while a level is being played in a competition with the AI check on. Samples window
-    titles often, browser history + DNS occasionally, batches findings, and POSTs them to
-    levelsvc. Stops itself if the server says the check is off. Never raises into the caller."""
-    TITLE_EVERY = 5      # seconds between window-title samples
-    SCAN_EVERY = 60      # seconds between history + DNS scans
-    POST_EVERY = 30      # seconds between uploads
+    titles + the clipboard often, browser history + DNS occasionally, batches findings, and POSTs
+    them to levelsvc. Stops itself if the server says the check is off. Never raises into the caller."""
+    TITLE_EVERY = 5         # seconds between window-title samples
+    SCAN_EVERY = 60         # seconds between history + DNS scans
+    POST_EVERY = 30         # seconds between uploads
+    HIST_LOOKBACK = 30 * 60 # also count browser history this long before Start (reading the
+                            # description and asking an AI, then starting, is still AI use)
 
     def __init__(self, levels, team, comp, report, cancel):
         self.levels, self.team, self.comp = levels, team, comp
@@ -1235,8 +1317,9 @@ class AIWatcher:
         self.thread = None
         self.stop_evt = threading.Event()
         self.since = time.time()
-        self.hist_since = self.since          # advances as history is consumed
+        self.hist_since = self.since - self.HIST_LOOKBACK  # advances as history is consumed
         self.dns_seen = set()                 # DNS has no timestamps; report each domain once
+        self.clip_seen = set()                # clipboard: report each distinct block once
         self.pending = {}                     # (source,service,evidence) -> [first,last,count]
         self.checks = {}
 
@@ -1297,6 +1380,19 @@ class AIWatcher:
                 self.dns_seen.add(dom)
                 self._add("dns", svc, dom, now)
 
+    def _scan_clipboard(self):
+        texts, method = _clipboard_texts()
+        self.checks["clipboard"] = method if method not in ("win32",) else "ok"
+        now = time.time()
+        for t in texts:
+            if not _looks_like_description(t):
+                continue
+            h = hash(t)
+            if h in self.clip_seen:
+                continue
+            self.clip_seen.add(h)
+            self._add("clipboard", "copied text", _clip_snippet(t) + " …", now)
+
     def _post(self):
         events = [{"source": s, "service": svc, "evidence": ev,
                    "first": int(f), "last": int(l), "count": c}
@@ -1320,6 +1416,7 @@ class AIWatcher:
         while not self.stop_evt.is_set() and not self.cancel.is_set():
             try:
                 self._scan_titles()
+                self._scan_clipboard()
                 now = time.time()
                 if now - last_scan >= self.SCAN_EVERY or last_scan == 0.0:
                     self._scan_history()
@@ -1721,8 +1818,8 @@ def run_gui(cfg, conf_dir):
             practicebar.pack_forget()
         if c.get("ai_check"):
             ai_note_var.set("Integrity check: while you play this competition, the app checks for "
-                            "AI-assistant use (ChatGPT, Claude, Gemini, Copilot, and similar). "
-                            "Google Search is fine. Do your own work.")
+                            "AI-assistant use (ChatGPT, Claude, Gemini, Copilot, and similar) and for "
+                            "copying the task text. Google Search is fine. Do your own work.")
             ai_note.pack(anchor="w", fill="x", after=compbar)
         else:
             ai_note_var.set("")

@@ -85,6 +85,21 @@ chmod +x "$EXE"
 BUILT_VER="$("$EXE" --version 2>/dev/null | awk '{print $NF}')"
 [ -n "$BUILT_VER" ] && echo "[*] pt_agent version: $BUILT_VER"
 
+# 1b) AI-use check helpers (Linux): window-title + clipboard detection use these system tools.
+# Browser-history detection works without them. Best-effort; never aborts the install.
+MISSING_TOOLS=""
+for t in xclip wmctrl; do command -v "$t" >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS $t"; done
+if [ -n "$MISSING_TOOLS" ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    S=""; [ "$(id -u)" -ne 0 ] && S="sudo"
+    echo "[*] installing AI-check helpers:$MISSING_TOOLS"
+    $S apt-get update -y >/dev/null 2>&1 || true
+    $S apt-get install -y $MISSING_TOOLS >/dev/null 2>&1 || true
+  fi
+  STILL=""; for t in xclip wmctrl; do command -v "$t" >/dev/null 2>&1 || STILL="$STILL $t"; done
+  [ -n "$STILL" ] && echo "[!] note: could not install$STILL — on Linux the AI check still detects AI-site visits via browser history, but window-title and clipboard detection need these tools."
+fi
+
 # 2) server config (baked-in defaults; students only enter a Team ID)
 cat > "$HERE/pt_agent.conf.json" <<CONF
 {

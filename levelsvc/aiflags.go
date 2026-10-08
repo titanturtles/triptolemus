@@ -26,7 +26,7 @@ const (
 	aiMaxPerTeam = 400      // distinct (signal, service, evidence) rows kept per team
 )
 
-var aiSources = map[string]bool{"title": true, "history": true, "dns": true}
+var aiSources = map[string]bool{"title": true, "history": true, "dns": true, "clipboard": true}
 
 type aiEvent struct {
 	Source   string `json:"source"`   // title | history | dns
