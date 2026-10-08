@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.6"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.7"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1080,23 +1080,57 @@ def _ai_window_titles():
 
 
 def _chromium_user_dirs():
-    """(label, user-data-dir) for each Chromium-family browser present."""
+    """(label, user-data-dir) for every Chromium-family browser present, including Snap and
+    Flatpak installs on Linux. The history DB is under <dir>/<profile>/History for one of the
+    profiles (Chrome: Default/Profile N; Opera: the dir itself)."""
     out = []
     home = os.path.expanduser("~")
     if sys.platform.startswith("win"):
         la = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        ro = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
         cands = [("Chrome", [la, "Google", "Chrome", "User Data"]),
+                 ("Chrome Beta", [la, "Google", "Chrome Beta", "User Data"]),
+                 ("Chrome Canary", [la, "Google", "Chrome SxS", "User Data"]),
                  ("Edge", [la, "Microsoft", "Edge", "User Data"]),
+                 ("Edge Beta", [la, "Microsoft", "Edge Beta", "User Data"]),
+                 ("Edge Dev", [la, "Microsoft", "Edge Dev", "User Data"]),
                  ("Chromium", [la, "Chromium", "User Data"]),
-                 ("Brave", [la, "BraveSoftware", "Brave-Browser", "User Data"])]
+                 ("Brave", [la, "BraveSoftware", "Brave-Browser", "User Data"]),
+                 ("Vivaldi", [la, "Vivaldi", "User Data"]),
+                 ("Yandex", [la, "Yandex", "YandexBrowser", "User Data"]),
+                 ("Opera", [ro, "Opera Software", "Opera Stable"]),
+                 ("Opera GX", [ro, "Opera Software", "Opera GX Stable"]),
+                 ("Opera Crypto", [ro, "Opera Software", "Opera Crypto Stable"]),
+                 ("Arc", [la, "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data"])]
     elif sys.platform == "darwin":
         app = [home, "Library", "Application Support"]
-        cands = [("Chrome", app + ["Google", "Chrome"]), ("Edge", app + ["Microsoft Edge"]),
-                 ("Chromium", app + ["Chromium"]), ("Brave", app + ["BraveSoftware", "Brave-Browser"])]
+        cands = [("Chrome", app + ["Google", "Chrome"]), ("Chrome Beta", app + ["Google", "Chrome Beta"]),
+                 ("Chrome Canary", app + ["Google", "Chrome Canary"]),
+                 ("Edge", app + ["Microsoft Edge"]), ("Chromium", app + ["Chromium"]),
+                 ("Brave", app + ["BraveSoftware", "Brave-Browser"]), ("Vivaldi", app + ["Vivaldi"]),
+                 ("Opera", app + ["com.operasoftware.Opera"]), ("Opera GX", app + ["com.operasoftware.OperaGX"]),
+                 ("Yandex", app + ["Yandex", "YandexBrowser"]), ("Arc", app + ["Arc", "User Data"])]
     else:
         cfg = [home, ".config"]
-        cands = [("Chrome", cfg + ["google-chrome"]), ("Edge", cfg + ["microsoft-edge"]),
-                 ("Chromium", cfg + ["chromium"]), ("Brave", cfg + ["BraveSoftware", "Brave-Browser"])]
+        flat = [home, ".var", "app"]
+        snap = [home, "snap"]
+        cands = [("Chrome", cfg + ["google-chrome"]), ("Chrome Beta", cfg + ["google-chrome-beta"]),
+                 ("Chrome Unstable", cfg + ["google-chrome-unstable"]),
+                 ("Edge", cfg + ["microsoft-edge"]), ("Edge Beta", cfg + ["microsoft-edge-beta"]),
+                 ("Edge Dev", cfg + ["microsoft-edge-dev"]),
+                 ("Chromium", cfg + ["chromium"]), ("Brave", cfg + ["BraveSoftware", "Brave-Browser"]),
+                 ("Vivaldi", cfg + ["vivaldi"]), ("Opera", cfg + ["opera"]), ("Opera GX", cfg + ["opera-gx"]),
+                 ("Yandex", cfg + ["yandex-browser"]),
+                 # Snap
+                 ("Chromium (snap)", snap + ["chromium", "common", "chromium"]),
+                 ("Brave (snap)", snap + ["brave", "common", "BraveSoftware", "Brave-Browser"]),
+                 # Flatpak
+                 ("Chrome (flatpak)", flat + ["com.google.Chrome", "config", "google-chrome"]),
+                 ("Chromium (flatpak)", flat + ["org.chromium.Chromium", "config", "chromium"]),
+                 ("Brave (flatpak)", flat + ["com.brave.Browser", "config", "BraveSoftware", "Brave-Browser"]),
+                 ("Edge (flatpak)", flat + ["com.microsoft.Edge", "config", "microsoft-edge"]),
+                 ("Opera (flatpak)", flat + ["com.opera.Opera", "config", "opera"]),
+                 ("Vivaldi (flatpak)", flat + ["com.vivaldi.Vivaldi", "config", "vivaldi"])]
     for label, parts in cands:
         p = os.path.join(*parts)
         if os.path.isdir(p):
@@ -1105,20 +1139,56 @@ def _chromium_user_dirs():
 
 
 def _firefox_profile_dirs():
+    """(label, profile-dir) for every Firefox-family profile present, including Snap/Flatpak and
+    forks (LibreWolf, Waterfox). A profile dir is one that contains places.sqlite."""
     home = os.path.expanduser("~")
+    bases = []  # (label, dir that holds profile folders)
     if sys.platform.startswith("win"):
-        base = os.path.join(os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")), "Mozilla", "Firefox", "Profiles")
+        ro = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        bases = [("Firefox", [ro, "Mozilla", "Firefox", "Profiles"]),
+                 ("LibreWolf", [ro, "librewolf", "Profiles"]),
+                 ("Waterfox", [ro, "Waterfox", "Profiles"])]
     elif sys.platform == "darwin":
-        base = os.path.join(home, "Library", "Application Support", "Firefox", "Profiles")
+        app = [home, "Library", "Application Support"]
+        bases = [("Firefox", app + ["Firefox", "Profiles"]), ("LibreWolf", app + ["LibreWolf", "Profiles"]),
+                 ("Waterfox", app + ["Waterfox", "Profiles"]), ("Tor", app + ["TorBrowser-Data", "Browser"])]
     else:
-        base = os.path.join(home, ".mozilla", "firefox")
+        bases = [("Firefox", [home, ".mozilla", "firefox"]),
+                 ("Firefox (snap)", [home, "snap", "firefox", "common", ".mozilla", "firefox"]),
+                 ("Firefox (flatpak)", [home, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox"]),
+                 ("LibreWolf", [home, ".librewolf"]),
+                 ("LibreWolf (flatpak)", [home, ".var", "app", "io.gitlab.librewolf-community", ".librewolf"]),
+                 ("Waterfox", [home, ".waterfox"])]
     dirs = []
-    if os.path.isdir(base):
-        for name in os.listdir(base):
+    for label, parts in bases:
+        base = os.path.join(*parts)
+        if not os.path.isdir(base):
+            continue
+        try:
+            names = os.listdir(base)
+        except Exception:
+            continue
+        for name in names:
             p = os.path.join(base, name)
             if os.path.isdir(p) and os.path.exists(os.path.join(p, "places.sqlite")):
-                dirs.append(p)
+                dirs.append((label, p))
     return dirs
+
+
+def _safari_history(since_unix):
+    """[(url, visit_time), ...] from Safari (macOS); visit_time is seconds since 2001-01-01."""
+    if sys.platform != "darwin":
+        return [], False
+    db = os.path.join(os.path.expanduser("~"), "Library", "Safari", "History.db")
+    if not os.path.exists(db):
+        return [], False
+    mac_threshold = since_unix - 978307200  # Safari stores seconds since 2001-01-01
+    rows = _query_sqlite_copy(
+        db,
+        "SELECT i.url, v.visit_time FROM history_visits v JOIN history_items i ON i.id = v.history_item "
+        "WHERE v.visit_time >= ?",
+        (mac_threshold,))
+    return rows, True
 
 
 def _query_sqlite_copy(src, sql, params):
@@ -1157,21 +1227,23 @@ def _query_sqlite_copy(src, sql, params):
 
 
 def _ai_history_visits(since_unix):
-    """[(browser, service, url, visit_unix), ...] for AI-site visits at/after since_unix.
-    Returns (visits, browsers_found)."""
+    """[(browser, service, url, visit_unix), ...] for AI-site visits at/after since_unix across
+    every Chromium- and Firefox-family browser found (Chrome, Edge, Brave, Opera, Vivaldi, …,
+    incl. Snap/Flatpak) and Safari. Returns (visits, browsers_found)."""
     visits = []
     found = []
     # Chromium family: visit_time is microseconds since 1601-01-01
     chrome_threshold = int((since_unix + 11644473600) * 1_000_000)
     for label, udd in _chromium_user_dirs():
-        hit = False
         try:
-            profiles = ["Default"] + [d for d in os.listdir(udd)
-                                      if d.startswith("Profile ") or d in ("Guest Profile", "System Profile")]
+            subdirs = [d for d in os.listdir(udd)
+                       if d == "Default" or d.startswith("Profile ") or d in ("Guest Profile", "System Profile")]
         except Exception:
-            profiles = ["Default"]
-        for prof in profiles:
-            hpath = os.path.join(udd, prof, "History")
+            subdirs = ["Default"]
+        hit = False
+        # "" = the dir itself (Opera keeps History there); dedupe so a profile isn't counted twice
+        for prof in dict.fromkeys([""] + subdirs):
+            hpath = os.path.join(udd, prof, "History") if prof else os.path.join(udd, "History")
             if not os.path.exists(hpath):
                 continue
             hit = True
@@ -1183,13 +1255,13 @@ def _ai_history_visits(since_unix):
                 svc = _ai_host_service(*_split_url(url))
                 if svc:
                     visits.append((label, svc, url, vt / 1_000_000 - 11644473600))
-        if hit:
+        if hit and label not in found:
             found.append(label)
-    # Firefox: visit_date is microseconds since the unix epoch
+    # Firefox family: visit_date is microseconds since the unix epoch
     ff_threshold = int(since_unix * 1_000_000)
-    ff_found = False
-    for prof in _firefox_profile_dirs():
-        ff_found = True
+    for label, prof in _firefox_profile_dirs():
+        if label not in found:
+            found.append(label)
         rows = _query_sqlite_copy(
             os.path.join(prof, "places.sqlite"),
             "SELECT p.url, v.visit_date FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id WHERE v.visit_date >= ?",
@@ -1199,9 +1271,17 @@ def _ai_history_visits(since_unix):
                 continue
             svc = _ai_host_service(*_split_url(url))
             if svc:
-                visits.append(("Firefox", svc, url, vd / 1_000_000))
-    if ff_found:
-        found.append("Firefox")
+                visits.append((label, svc, url, vd / 1_000_000))
+    # Safari (macOS): visit_time is seconds since 2001-01-01
+    safari_rows, safari_found = _safari_history(since_unix)
+    if safari_found:
+        found.append("Safari")
+        for url, vt in safari_rows:
+            if vt is None or vt + 978307200 < since_unix:
+                continue
+            svc = _ai_host_service(*_split_url(url))
+            if svc:
+                visits.append(("Safari", svc, url, vt + 978307200))
     return visits, found
 
 
