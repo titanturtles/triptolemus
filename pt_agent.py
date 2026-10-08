@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.7"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.8"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -973,17 +973,25 @@ def comp_cfg(shared, competition):
 # service name -> (hostname domains, extra window-title tokens)
 AI_SERVICES = [
     ("ChatGPT",           ["chatgpt.com", "chat.openai.com", "openai.com"], ["chatgpt"]),
-    ("Claude",            ["claude.ai", "claude.com"],                       ["claude.ai"]),
-    ("Google Gemini",     ["gemini.google.com", "bard.google.com"],          []),
+    ("Claude",            ["claude.ai", "claude.com", "anthropic.com"],      ["claude.ai"]),
+    ("Google Gemini",     ["gemini.google.com", "bard.google.com", "aistudio.google.com",
+                           "generativelanguage.googleapis.com"],            []),
     ("Microsoft Copilot", ["copilot.microsoft.com", "copilot.cloud.microsoft", "m365.cloud.microsoft"], ["copilot"]),
     ("GitHub Copilot",    ["github.com/copilot", "githubcopilot.com"],       []),
     ("Perplexity",        ["perplexity.ai"],                                 ["perplexity"]),
     ("DeepSeek",          ["deepseek.com"],                                  ["deepseek"]),
     ("Grok",              ["grok.com", "x.ai"],                              []),
     ("Poe",               ["poe.com"],                                       []),
-    ("Mistral / Le Chat", ["chat.mistral.ai"],                               []),
+    ("Mistral / Le Chat", ["mistral.ai"],                                    []),
     ("Meta AI",           ["meta.ai"],                                       []),
     ("Anthropic Console", ["console.anthropic.com"],                         []),
+    # model-provider API endpoints used by AI coding agents (opencode, Aider, Cline, …)
+    ("OpenRouter",        ["openrouter.ai"],                                 []),
+    ("Groq",              ["groq.com"],                                      []),
+    ("Together AI",       ["together.ai", "together.xyz"],                   []),
+    ("Fireworks AI",      ["fireworks.ai"],                                  []),
+    ("DeepInfra",         ["deepinfra.com"],                                 []),
+    ("Hugging Face",      ["huggingface.co", "hf.co"],                       []),
 ]
 
 # window titles that are really a search-results page are not AI use (a student may search
@@ -1313,6 +1321,95 @@ def _ai_dns_cache():
     return [(svc, dom) for dom, svc in hits.items()]
 
 
+# Locally-run AI tools: terminal coding agents, local model runners, and AI desktop apps. Matched
+# on the process's executable basename (and argv tokens), so they are caught even though they are
+# not websites and never touch the browser. Names are chosen to be specific to AI tools.
+AI_PROCESSES = {
+    "opencode": "opencode", "aider": "Aider", "cursor": "Cursor", "claude": "Claude Code",
+    "codeium": "Codeium", "windsurf": "Windsurf", "cody": "Cody",
+    "ollama": "Ollama", "gpt4all": "GPT4All", "lmstudio": "LM Studio", "jan": "Jan",
+    "chatgpt": "ChatGPT app", "perplexity": "Perplexity app", "copilot": "Copilot",
+    "aichat": "aichat", "gptme": "gptme", "llamafile": "llamafile",
+    "localai": "LocalAI", "gemini": "Gemini CLI", "codex": "Codex CLI",
+}
+_PROC_STRIP = (".exe", ".app", ".py", ".js", ".cmd", ".bat", ".bin")
+
+
+def _proc_candidates(argv):
+    """Executable-name candidates from a process argv: each token's basename, extension stripped."""
+    out = set()
+    for tok in argv[:12]:
+        name = os.path.basename(tok.strip().strip('"')).lower()
+        for ext in _PROC_STRIP:
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+        if name:
+            out.add(name)
+    return out
+
+
+def _list_processes():
+    """[(pid, argv_list), ...] for the current user's processes, best-effort per platform."""
+    procs = []
+    if sys.platform.startswith("win"):
+        try:
+            # image name + command line via WMIC (present on most Windows); fall back to tasklist
+            out = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=8)
+            import csv, io
+            for row in csv.reader(io.StringIO(out.stdout)):
+                if row:
+                    procs.append((row[1] if len(row) > 1 else "0", [row[0]]))
+        except Exception:
+            pass
+        return procs
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["ps", "-axww", "-o", "pid=", "-o", "command="], capture_output=True, text=True, timeout=8)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                pid, _, cmd = line.partition(" ")
+                procs.append((pid, cmd.split()))
+        except Exception:
+            pass
+        return procs
+    # Linux: read /proc
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % pid, "rb") as f:
+                    argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+                if not argv:
+                    with open("/proc/%s/comm" % pid) as f:
+                        argv = [f.read().strip()]
+                if argv:
+                    procs.append((pid, argv))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return procs
+
+
+def _running_ai_processes():
+    """[(tool_display, pid, evidence), ...] for AI tools currently running, plus a method string."""
+    procs = _list_processes()
+    if not procs:
+        return [], "unavailable"
+    hits = []
+    for pid, argv in procs:
+        for name in _proc_candidates(argv):
+            if name in AI_PROCESSES:
+                cmd = " ".join(argv)
+                evid = AI_PROCESSES[name] + " — " + (cmd if len(cmd) <= 160 else cmd[:160] + " …")
+                hits.append((AI_PROCESSES[name], pid, evid))
+                break
+    return hits, "ok"
+
+
 def _clipboard_texts():
     """(texts, method): the current clipboard (and, on X11, the highlighted PRIMARY selection).
     Copying the task description to paste into an AI lands here. Best-effort, no hard deps."""
@@ -1399,6 +1496,7 @@ class AIWatcher:
         self.since = time.time()
         self.hist_since = self.since - self.HIST_LOOKBACK  # advances as history is consumed
         self.dns_seen = set()                 # DNS has no timestamps; report each domain once
+        self.proc_seen = set()                # processes: report each (tool, pid) once
         self.clip_seen = set()                # clipboard: report each distinct block once
         self.pending = {}                     # (source,service,evidence) -> [first,last,count]
         self.checks = {}
@@ -1460,6 +1558,17 @@ class AIWatcher:
                 self.dns_seen.add(dom)
                 self._add("dns", svc, dom, now)
 
+    def _scan_processes(self):
+        hits, method = _running_ai_processes()
+        self.checks["processes"] = method
+        now = time.time()
+        for tool, pid, evid in hits:
+            key = (tool, pid)
+            if key in self.proc_seen:
+                continue
+            self.proc_seen.add(key)
+            self._add("process", tool, evid, now)
+
     def _scan_clipboard(self):
         texts, method = _clipboard_texts()
         self.checks["clipboard"] = method if method not in ("win32",) else "ok"
@@ -1501,6 +1610,7 @@ class AIWatcher:
                 if now - last_scan >= self.SCAN_EVERY or last_scan == 0.0:
                     self._scan_history()
                     self._scan_dns()
+                    self._scan_processes()
                     last_scan = now
                 if now - last_post >= self.POST_EVERY or last_post == 0.0:
                     self._post()
