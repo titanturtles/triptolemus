@@ -78,6 +78,7 @@ type Competition struct {
 	Practice     bool     `json:"practice,omitempty"`     // label only; no behavior change
 	Private      bool     `json:"private,omitempty"`      // when true, only AllowedTeams can see it (absent = public)
 	AllowedTeams []string `json:"allowedTeams,omitempty"` // team IDs with early (pre-release) visibility
+	AICheck      bool     `json:"aiCheck,omitempty"`      // agents report AI-assistant use while a level runs (aiflags.go)
 	Levels       []Level  `json:"levels"`
 }
 
@@ -257,11 +258,12 @@ type Config struct {
 	ClassToken   string        `json:"classToken"` // student-facing token for GET /enroll
 	SarpConf     string        `json:"sarpConf"`
 	ProgressDir  string        `json:"progressDir"`
-	PkaTool      string        `json:"pkaTool"`  // path to the pka_tool binary (for server-side hash extraction)
-	Remote       string        `json:"remote"`   // sarpedon base URL students POST scores to
-	PtAppID      string        `json:"ptAppId"`  // shared ExApp id (same for all competitions)
-	PtSecret     string        `json:"ptSecret"` // shared ExApp secret
-	AgentDir     string        `json:"agentDir"` // where published pt_agent builds live (auto-update)
+	PkaTool      string        `json:"pkaTool"`   // path to the pka_tool binary (for server-side hash extraction)
+	Remote       string        `json:"remote"`    // sarpedon base URL students POST scores to
+	PtAppID      string        `json:"ptAppId"`   // shared ExApp id (same for all competitions)
+	PtSecret     string        `json:"ptSecret"`  // shared ExApp secret
+	AgentDir     string        `json:"agentDir"`  // where published pt_agent builds live (auto-update)
+	AIFlagDir    string        `json:"aiFlagDir"` // AI-use reports, one dir per competition (aiflags.go)
 	Competitions []Competition `json:"competitions"`
 	Levels       []Level       `json:"levels,omitempty"` // legacy single-competition; migrated on load
 }
@@ -372,7 +374,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	unlocked, levels := computeStatus(team, cp.Levels, cp.Practice)
 	writeJSON(w, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "team": team,
-		"practice": cp.Practice, "unlocked": unlocked, "levels": levels})
+		"practice": cp.Practice, "ai_check": cp.AICheck, "unlocked": unlocked, "levels": levels})
 }
 
 func levelHandler(w http.ResponseWriter, r *http.Request) {
@@ -542,6 +544,7 @@ func adminCompetitions(w http.ResponseWriter, r *http.Request) {
 			"id": cp.ID, "name": cp.Name, "hidden": cp.Hidden, "default": cp.Default,
 			"practice": cp.Practice, "private": cp.Private, "allowedTeams": cp.AllowedTeams,
 			"levels": len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
+			"aiCheck": cp.AICheck, "aiFlagged": countAIFlagged(c, cp.ID),
 		})
 	}
 	writeJSON(w, map[string]interface{}{"competitions": list})
@@ -1074,6 +1077,8 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 	hasVis := r.FormValue("vis") != "" // this client manages visibility (else leave it unchanged)
 	private := hasVis && r.FormValue("public") == ""
 	allowed := parseTeamList(r.FormValue("allowedTeams"))
+	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
+	aiCheck := r.FormValue("aiCheck") != ""
 	c := snapshot()
 	dir := filepath.Join(c.FilesDir, comp)
 	os.MkdirAll(dir, 0755)
@@ -1128,12 +1133,15 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 				cfg.Competitions[i].Private = private
 				cfg.Competitions[i].AllowedTeams = allowed
 			}
+			if hasAI {
+				cfg.Competitions[i].AICheck = aiCheck
+			}
 			cfg.Competitions[i].Levels = newLevels
 			found = true
 		}
 	}
 	if !found {
-		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, Levels: newLevels})
+		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, AICheck: aiCheck, Levels: newLevels})
 	}
 	persistLocked()
 	cfgMu.Unlock()
@@ -1173,6 +1181,8 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	hasVis := r.FormValue("vis") != "" // this client manages visibility (else leave it unchanged)
 	private := hasVis && r.FormValue("public") == ""
 	allowed := parseTeamList(r.FormValue("allowedTeams"))
+	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
+	aiCheck := r.FormValue("aiCheck") != ""
 	if comp == "" {
 		http.Error(w, "comp required", 400)
 		return
@@ -1257,6 +1267,9 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 			if hasVis {
 				cfg.Competitions[i].Private = private
 				cfg.Competitions[i].AllowedTeams = allowed
+			}
+			if hasAI {
+				cfg.Competitions[i].AICheck = aiCheck
 			}
 			cfg.Competitions[i].Levels = newLevels
 		}
@@ -1553,7 +1566,8 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 				"password": l.Password, "pt_password": l.PtPassword,
 			})
 		}
-		comps = append(comps, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "practice": cp.Practice, "levels": levels})
+		comps = append(comps, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "practice": cp.Practice,
+			"ai_check": cp.AICheck, "levels": levels})
 	}
 	if def == "" && len(comps) > 0 {
 		def = comps[0]["comp"].(string) // fall back to the first visible competition
@@ -1664,6 +1678,9 @@ func main() {
 	if cfg.ProgressDir == "" {
 		cfg.ProgressDir = "/opt/levelsvc/progress"
 	}
+	if cfg.AIFlagDir == "" {
+		cfg.AIFlagDir = "/opt/levelsvc/aiflags"
+	}
 	if cfg.PkaTool == "" {
 		cfg.PkaTool = "/opt/levelsvc/pka_tool"
 	}
@@ -1702,6 +1719,8 @@ func main() {
 	http.HandleFunc("/progress", progressHandler)
 	http.HandleFunc("/enroll", enrollHandler)
 	http.HandleFunc("/reset", resetHandler)
+	http.HandleFunc("/aiflag", aiflagHandler)
+	http.HandleFunc("/admin/aiflags", adminAIFlags)
 	http.HandleFunc("/agent/latest", agentLatest)
 	http.HandleFunc("/agent/file", agentFile)
 	http.HandleFunc("/admin/agentpublish", adminAgentPublish)

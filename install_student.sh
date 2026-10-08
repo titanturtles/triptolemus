@@ -17,14 +17,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEVELSVC="${LEVELSVC:-https://scoreboard.titanturtles.xyz/levels}"
 CLASS_TOKEN="${CLASS_TOKEN:-0b90c526f93f638dd1fb1bd1b27e2c18a521c30daf8203a0}"
-NAME="Cisco PT Competition"
+NAME="PT Comp"
 EXE="$HERE/pt_agent"
-APP_DESKTOP="$HOME/.local/share/applications/cisco-pt-competition.desktop"
-AUTOSTART="$HOME/.config/autostart/cisco-pt-competition.desktop"
-DESK_ICON="$HOME/Desktop/cisco-pt-competition.desktop"
+APP_DESKTOP="$HOME/.local/share/applications/pt-comp.desktop"
+AUTOSTART="$HOME/.config/autostart/pt-comp.desktop"
+DESK_ICON="$HOME/Desktop/pt-comp.desktop"
+# older installs used these names; clean them up so there is just one icon
+OLD_ENTRIES=("$HOME/.local/share/applications/cisco-pt-competition.desktop" "$HOME/.config/autostart/cisco-pt-competition.desktop" "$HOME/Desktop/cisco-pt-competition.desktop")
 
 if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "-r" ]; then
-  rm -f "$APP_DESKTOP" "$AUTOSTART" "$DESK_ICON"
+  rm -f "$APP_DESKTOP" "$AUTOSTART" "$DESK_ICON" "${OLD_ENTRIES[@]}"
   echo "[+] removed launcher + autostart (Packet Tracer registration untouched)"
   exit 0
 fi
@@ -107,6 +109,7 @@ Terminal=false
 Categories=Education;
 ENTRY
 cp "$APP_DESKTOP" "$AUTOSTART"
+rm -f "${OLD_ENTRIES[@]}"   # no duplicate icons from older installs
 cp "$APP_DESKTOP" "$DESK_ICON"
 chmod +x "$DESK_ICON" 2>/dev/null || true
 gio set "$DESK_ICON" metadata::trusted true 2>/dev/null || true   # GNOME: allow launching

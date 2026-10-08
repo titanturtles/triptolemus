@@ -25,13 +25,15 @@ param(
 $ErrorActionPreference = "Stop"
 
 $here    = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$name    = "Cisco PT Competition.lnk"
+$name    = "PT Comp.lnk"
+$oldname = "Cisco PT Competition.lnk"   # remove shortcuts from older installs
 $desktop = [Environment]::GetFolderPath("Desktop")
 $startup = [Environment]::GetFolderPath("Startup")
 $targets = @((Join-Path $desktop $name), (Join-Path $startup $name))
+$oldtargets = @((Join-Path $desktop $oldname), (Join-Path $startup $oldname))
 
 if ($Remove) {
-    foreach ($t in $targets) { if (Test-Path $t) { Remove-Item $t -Force; Write-Host "removed $t" } }
+    foreach ($t in ($targets + $oldtargets)) { if (Test-Path $t) { Remove-Item $t -Force; Write-Host "removed $t" } }
     Write-Host "Done (Packet Tracer registration was not touched)."
     return
 }
@@ -104,13 +106,14 @@ foreach ($need in @("pt_agent.conf.json", "ptagent.pta")) {
 }
 
 # 3) shortcuts: Desktop + Startup (auto-start at login)
+foreach ($t in $oldtargets) { if (Test-Path $t) { Remove-Item $t -Force; Write-Host "removed old $t" } }
 $ws = New-Object -ComObject WScript.Shell
 foreach ($t in $targets) {
     $lnk = $ws.CreateShortcut($t)
     $lnk.TargetPath       = $exe
     $lnk.WorkingDirectory = $here
     $lnk.IconLocation     = $exe
-    $lnk.Description       = "Cisco Packet Tracer Competition"
+    $lnk.Description       = "PT Comp"
     $lnk.Save()
     Write-Host "created $t"
 }

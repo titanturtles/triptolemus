@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.4"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.5"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -404,6 +404,17 @@ class LevelsClient:
         with urllib.request.urlopen(req, timeout=max(self.timeout, 30)) as r:
             return r.getcode()
 
+    def aiflag(self, team, comp, payload):
+        """POST an AI-use report (competition integrity). Returns the parsed JSON reply."""
+        q = {"team": team}
+        if comp:
+            q["comp"] = comp
+        req = urllib.request.Request(self.base + "/aiflag?" + urllib.parse.urlencode(q),
+                                     data=json.dumps(payload).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode())
+
 
 # ---------------- OS helpers ----------------
 def close_pt():
@@ -565,6 +576,8 @@ class Competition:
         self.client = None
         self.comp = cfg.get("comp", "")
         self.practice = bool(cfg.get("practice", False))
+        self.ai_check = bool(cfg.get("ai_check", False))  # competition asks agents to check for AI use
+        self.ai_watch = None          # AIWatcher while a level is running (if ai_check)
         self.free_switch = False      # practice "unlock all": disables auto-advance, allows jumps
         self.levels = LevelsClient(cfg["levelsvc"])
         self.tmp = None
@@ -745,6 +758,7 @@ class Competition:
             self.report("error", "Could not start:\n\n" + str(e))
             self.report("state", "idle")
             return
+        self._start_ai_watch()
         self.loop_stop = threading.Event()
         self.loop_thread = threading.Thread(target=self._loop, daemon=True)
         self.loop_thread.start()
@@ -756,6 +770,24 @@ class Competition:
         if self.loop_thread:
             self.loop_thread.join(timeout=20)
         self.loop_thread = None
+        self._stop_ai_watch()
+
+    def _start_ai_watch(self):
+        if not self.ai_check or self.ai_watch:
+            return
+        try:
+            self.ai_watch = AIWatcher(self.levels, self.team, self.comp, self.report, self.cancel)
+            self.ai_watch.start()
+        except Exception:
+            self.ai_watch = None
+
+    def _stop_ai_watch(self):
+        if self.ai_watch:
+            try:
+                self.ai_watch.stop()
+            except Exception:
+                pass
+            self.ai_watch = None
 
     def start_over(self):
         """Discard the current level's progress and reload a clean copy, then run."""
@@ -923,8 +955,388 @@ def comp_cfg(shared, competition):
     c = dict(shared)
     c["comp"] = competition.get("comp", "")
     c["practice"] = bool(competition.get("practice", False))
+    c["ai_check"] = bool(competition.get("ai_check", False))
     c["levels"] = competition.get("levels", [])
     return c
+
+
+# ---------------- AI-use check (competition integrity) ----------------
+# While a level runs in a competition with the AI check on, look for AI assistants and report
+# what is found to levelsvc POST /aiflag. Students are told the check is on; nothing is shown when
+# it fires. Google Search and its AI Overviews are deliberately NOT flagged (only dedicated AI
+# assistants are). Every probe is best-effort and wrapped so it can never crash the agent.
+#
+# Signals: open window titles (sampled), browser history since the run started (Chrome/Edge/
+# Chromium/Brave/Firefox), and the Windows DNS cache. History is the strongest; a DNS hit alone
+# is weak (Windows Copilot / link prefetch can cause it) and is marked as such on the admin page.
+
+# service name -> (hostname domains, extra window-title tokens)
+AI_SERVICES = [
+    ("ChatGPT",           ["chatgpt.com", "chat.openai.com", "openai.com"], ["chatgpt"]),
+    ("Claude",            ["claude.ai", "claude.com"],                       ["claude.ai"]),
+    ("Google Gemini",     ["gemini.google.com", "bard.google.com"],          []),
+    ("Microsoft Copilot", ["copilot.microsoft.com", "copilot.cloud.microsoft", "m365.cloud.microsoft"], ["copilot"]),
+    ("GitHub Copilot",    ["github.com/copilot", "githubcopilot.com"],       []),
+    ("Perplexity",        ["perplexity.ai"],                                 ["perplexity"]),
+    ("DeepSeek",          ["deepseek.com"],                                  ["deepseek"]),
+    ("Grok",              ["grok.com", "x.ai"],                              []),
+    ("Poe",               ["poe.com"],                                       []),
+    ("Mistral / Le Chat", ["chat.mistral.ai"],                               []),
+    ("Meta AI",           ["meta.ai"],                                       []),
+    ("Anthropic Console", ["console.anthropic.com"],                         []),
+]
+
+# window titles that are really a search-results page are not AI use (a student may search
+# "chatgpt" on Google) — skip any title that looks like a search page.
+_SEARCH_TITLE = ("google search", "search results", "- bing", "duckduckgo", "- search")
+
+
+def _ai_host_service(host, path=""):
+    """Return the AI service for a URL host (+path), or None. Hostname matches respect dot
+    boundaries so 'notclaude.ai.example.com' does not match 'claude.ai'."""
+    host = (host or "").lower().strip().lstrip(".")
+    hp = host + (path or "").lower()
+    for name, domains, _tokens in AI_SERVICES:
+        for d in domains:
+            if "/" in d:
+                if d in hp:
+                    return name
+            elif host == d or host.endswith("." + d):
+                return name
+    return None
+
+
+def _ai_title_service(title):
+    """Return the AI service a window title reveals, or None (search-result pages excluded)."""
+    t = (title or "").lower()
+    if not t:
+        return None
+    if any(s in t for s in _SEARCH_TITLE):
+        return None
+    for name, domains, tokens in AI_SERVICES:
+        for tok in tokens:
+            if tok in t:
+                return name
+    return None
+
+
+def _ai_window_titles():
+    """(titles, method) for the open top-level windows, best-effort per platform."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            titles = []
+            user32 = ctypes.windll.user32
+            EnumWindows = user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+            def cb(hwnd, _):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    if buf.value:
+                        titles.append(buf.value)
+                return True
+
+            EnumWindows(EnumWindowsProc(cb), 0)
+            return titles, "win32"
+        except Exception:
+            return [], "unavailable"
+    # Linux / X11: try wmctrl, then xdotool, then xprop (whichever is installed)
+    try:
+        if shutil.which("wmctrl"):
+            out = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                titles = [line.split(None, 3)[3] for line in out.stdout.splitlines() if len(line.split(None, 3)) == 4]
+                return titles, "wmctrl"
+        if shutil.which("xdotool"):
+            ids = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ""],
+                                 capture_output=True, text=True, timeout=5)
+            titles = []
+            for wid in ids.stdout.split():
+                g = subprocess.run(["xdotool", "getwindowname", wid], capture_output=True, text=True, timeout=3)
+                if g.returncode == 0 and g.stdout.strip():
+                    titles.append(g.stdout.strip())
+            return titles, "xdotool"
+        if shutil.which("xprop"):
+            root = subprocess.run(["xprop", "-root", "_NET_CLIENT_LIST"], capture_output=True, text=True, timeout=5)
+            ids = [w.strip() for w in root.stdout.split("#", 1)[-1].split(",")] if "#" in root.stdout else []
+            titles = []
+            for wid in ids:
+                wid = wid.strip()
+                if not wid.startswith("0x"):
+                    continue
+                g = subprocess.run(["xprop", "-id", wid, "_NET_WM_NAME"], capture_output=True, text=True, timeout=3)
+                if '"' in g.stdout:
+                    titles.append(g.stdout.split('"', 2)[1])
+            return titles, "xprop"
+    except Exception:
+        pass
+    return [], "unavailable"
+
+
+def _chromium_user_dirs():
+    """(label, user-data-dir) for each Chromium-family browser present."""
+    out = []
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        la = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        cands = [("Chrome", [la, "Google", "Chrome", "User Data"]),
+                 ("Edge", [la, "Microsoft", "Edge", "User Data"]),
+                 ("Chromium", [la, "Chromium", "User Data"]),
+                 ("Brave", [la, "BraveSoftware", "Brave-Browser", "User Data"])]
+    elif sys.platform == "darwin":
+        app = [home, "Library", "Application Support"]
+        cands = [("Chrome", app + ["Google", "Chrome"]), ("Edge", app + ["Microsoft Edge"]),
+                 ("Chromium", app + ["Chromium"]), ("Brave", app + ["BraveSoftware", "Brave-Browser"])]
+    else:
+        cfg = [home, ".config"]
+        cands = [("Chrome", cfg + ["google-chrome"]), ("Edge", cfg + ["microsoft-edge"]),
+                 ("Chromium", cfg + ["chromium"]), ("Brave", cfg + ["BraveSoftware", "Brave-Browser"])]
+    for label, parts in cands:
+        p = os.path.join(*parts)
+        if os.path.isdir(p):
+            out.append((label, p))
+    return out
+
+
+def _firefox_profile_dirs():
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        base = os.path.join(os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")), "Mozilla", "Firefox", "Profiles")
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support", "Firefox", "Profiles")
+    else:
+        base = os.path.join(home, ".mozilla", "firefox")
+    dirs = []
+    if os.path.isdir(base):
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "places.sqlite")):
+                dirs.append(p)
+    return dirs
+
+
+def _query_sqlite_copy(src, sql, params):
+    """Copy a (possibly locked) sqlite DB to a temp file and run one query. Returns rows or []."""
+    import sqlite3
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        shutil.copy2(src, tmp)
+        con = sqlite3.connect(tmp)
+        try:
+            return list(con.execute(sql, params))
+        finally:
+            con.close()
+    except Exception:
+        return []
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _ai_history_visits(since_unix):
+    """[(browser, service, url, visit_unix), ...] for AI-site visits at/after since_unix.
+    Returns (visits, browsers_found)."""
+    visits = []
+    found = []
+    # Chromium family: visit_time is microseconds since 1601-01-01
+    chrome_threshold = int((since_unix + 11644473600) * 1_000_000)
+    for label, udd in _chromium_user_dirs():
+        hit = False
+        try:
+            profiles = ["Default"] + [d for d in os.listdir(udd)
+                                      if d.startswith("Profile ") or d in ("Guest Profile", "System Profile")]
+        except Exception:
+            profiles = ["Default"]
+        for prof in profiles:
+            hpath = os.path.join(udd, prof, "History")
+            if not os.path.exists(hpath):
+                continue
+            hit = True
+            rows = _query_sqlite_copy(
+                hpath,
+                "SELECT u.url, v.visit_time FROM visits v JOIN urls u ON u.id = v.url WHERE v.visit_time >= ?",
+                (chrome_threshold,))
+            for url, vt in rows:
+                svc = _ai_host_service(*_split_url(url))
+                if svc:
+                    visits.append((label, svc, url, vt / 1_000_000 - 11644473600))
+        if hit:
+            found.append(label)
+    # Firefox: visit_date is microseconds since the unix epoch
+    ff_threshold = int(since_unix * 1_000_000)
+    ff_found = False
+    for prof in _firefox_profile_dirs():
+        ff_found = True
+        rows = _query_sqlite_copy(
+            os.path.join(prof, "places.sqlite"),
+            "SELECT p.url, v.visit_date FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id WHERE v.visit_date >= ?",
+            (ff_threshold,))
+        for url, vd in rows:
+            if vd is None:
+                continue
+            svc = _ai_host_service(*_split_url(url))
+            if svc:
+                visits.append(("Firefox", svc, url, vd / 1_000_000))
+    if ff_found:
+        found.append("Firefox")
+    return visits, found
+
+
+def _split_url(url):
+    try:
+        p = urllib.parse.urlsplit(url)
+        return p.hostname or "", p.path or ""
+    except Exception:
+        return "", ""
+
+
+def _ai_dns_cache():
+    """[(service, domain), ...] AI domains in the Windows DNS cache (Windows only)."""
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        out = subprocess.run(["ipconfig", "/displaydns"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+    hits = {}
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if "record name" in low or (low and "." in low and ":" in low and "name" in low):
+            name = line.split(":", 1)[-1].strip()
+            svc = _ai_host_service(name)
+            if svc:
+                hits[name.lower()] = svc
+    return [(svc, dom) for dom, svc in hits.items()]
+
+
+class AIWatcher:
+    """Runs while a level is being played in a competition with the AI check on. Samples window
+    titles often, browser history + DNS occasionally, batches findings, and POSTs them to
+    levelsvc. Stops itself if the server says the check is off. Never raises into the caller."""
+    TITLE_EVERY = 5      # seconds between window-title samples
+    SCAN_EVERY = 60      # seconds between history + DNS scans
+    POST_EVERY = 30      # seconds between uploads
+
+    def __init__(self, levels, team, comp, report, cancel):
+        self.levels, self.team, self.comp = levels, team, comp
+        self.report, self.cancel = report, cancel
+        self.thread = None
+        self.stop_evt = threading.Event()
+        self.since = time.time()
+        self.hist_since = self.since          # advances as history is consumed
+        self.dns_seen = set()                 # DNS has no timestamps; report each domain once
+        self.pending = {}                     # (source,service,evidence) -> [first,last,count]
+        self.checks = {}
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.thread:
+            self.thread.join(timeout=8)
+        self.thread = None
+
+    def _add(self, source, service, evidence, when, count=1):
+        evidence = (evidence or "")[:300]
+        key = (source, service, evidence)
+        e = self.pending.get(key)
+        if e:
+            e[0] = min(e[0], when)
+            e[1] = max(e[1], when)
+            e[2] += count
+        else:
+            self.pending[key] = [when, when, count]
+
+    def _scan_titles(self):
+        titles, method = _ai_window_titles()
+        self.checks["titles"] = method if method != "win32" else "ok"
+        now = time.time()
+        for t in titles:
+            svc = _ai_title_service(t)
+            if svc:
+                self._add("title", svc, t, now)
+
+    def _scan_history(self):
+        try:
+            visits, browsers = _ai_history_visits(self.hist_since)
+        except Exception:
+            self.checks["history"] = "error"
+            return
+        self.checks["history"] = ", ".join(browsers) if browsers else "none found"
+        newest = self.hist_since
+        for _browser, svc, url, vt in visits:
+            if vt < self.hist_since:
+                continue
+            self._add("history", svc, f"{_browser}: {url}", vt)
+            newest = max(newest, vt)
+        # advance past what we've counted (guard against clock skew), so visits count once
+        self.hist_since = max(self.hist_since, newest + 0.001)
+
+    def _scan_dns(self):
+        if not sys.platform.startswith("win"):
+            self.checks["dns"] = "n/a (not Windows)"
+            return
+        self.checks["dns"] = "ok"
+        now = time.time()
+        for svc, dom in _ai_dns_cache():
+            if dom not in self.dns_seen:
+                self.dns_seen.add(dom)
+                self._add("dns", svc, dom, now)
+
+    def _post(self):
+        events = [{"source": s, "service": svc, "evidence": ev,
+                   "first": int(f), "last": int(l), "count": c}
+                  for (s, svc, ev), (f, l, c) in self.pending.items()]
+        payload = {"version": AGENT_VERSION, "platform": _platform_key(),
+                   "since": int(self.since), "checks": dict(self.checks), "events": events}
+        try:
+            resp = self.levels.aiflag(self.team, self.comp, payload)
+        except Exception:
+            return  # keep pending; retry next cycle
+        if isinstance(resp, dict) and resp.get("status") == "off":
+            self.stop_evt.set()   # the server turned the check off for this competition
+            self.pending.clear()
+            return
+        self.pending.clear()      # delivered; server merges by (source,service,evidence)
+
+    def _run(self):
+        last_scan = 0.0
+        last_post = 0.0
+        # a first scan + post right away, so a tab already open at Start is caught promptly
+        while not self.stop_evt.is_set() and not self.cancel.is_set():
+            try:
+                self._scan_titles()
+                now = time.time()
+                if now - last_scan >= self.SCAN_EVERY or last_scan == 0.0:
+                    self._scan_history()
+                    self._scan_dns()
+                    last_scan = now
+                if now - last_post >= self.POST_EVERY or last_post == 0.0:
+                    self._post()
+                    last_post = now
+            except Exception:
+                pass
+            self.stop_evt.wait(self.TITLE_EVERY)
+        # flush anything still pending on a clean stop
+        try:
+            if self.pending and not self.cancel.is_set():
+                self._post()
+        except Exception:
+            pass
 
 
 # ---------------- GUI ----------------
@@ -938,7 +1350,7 @@ def run_gui(cfg, conf_dir):
     server_served = bool(cfg.get("class_token"))  # bootstrap config pulls competitions from the server
 
     root = tk.Tk()
-    root.title(f"TitanTurtles — Packet Tracer Competition (v{AGENT_VERSION})")
+    root.title(f"PT Comp (v{AGENT_VERSION})")
     root.geometry("680x600")
 
     # Open at a normal size even if the window manager tries to maximize a new window on
@@ -1023,6 +1435,11 @@ def run_gui(cfg, conf_dir):
     level_combo.pack(side="left", padx=6)
     goto_btn = ttk.Button(practicebar, text="Go", state="disabled")  # command wired below
     goto_btn.pack(side="left")
+
+    # shown when the selected competition checks for AI-assistant use (integrity notice)
+    ai_note_var = tk.StringVar(value="")
+    ai_note = ttk.Label(root, textvariable=ai_note_var, foreground="#e0a33a",
+                        wraplength=640, justify="left", padding=(12, 0, 10, 0))
 
     frm = ttk.Frame(root, padding=10)
     frm.pack(fill="both", expand=True)
@@ -1302,6 +1719,14 @@ def run_gui(cfg, conf_dir):
         else:
             free_switch_var.set(False)
             practicebar.pack_forget()
+        if c.get("ai_check"):
+            ai_note_var.set("Integrity check: while you play this competition, the app checks for "
+                            "AI-assistant use (ChatGPT, Claude, Gemini, Copilot, and similar). "
+                            "Google Search is fine. Do your own work.")
+            ai_note.pack(anchor="w", fill="x", after=compbar)
+        else:
+            ai_note_var.set("")
+            ai_note.pack_forget()
         nm = c.get("name") or c.get("comp")
         status_var.set(f"Selected “{nm}”. Enter your Team ID and click Start.")
 
