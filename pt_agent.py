@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.8"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.9"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1511,7 +1511,7 @@ class AIWatcher:
             self.thread.join(timeout=8)
         self.thread = None
 
-    def _add(self, source, service, evidence, when, count=1):
+    def _add(self, source, service, evidence, when, count=1, full=""):
         evidence = (evidence or "")[:300]
         key = (source, service, evidence)
         e = self.pending.get(key)
@@ -1519,8 +1519,10 @@ class AIWatcher:
             e[0] = min(e[0], when)
             e[1] = max(e[1], when)
             e[2] += count
+            if full:
+                e[3] = full
         else:
-            self.pending[key] = [when, when, count]
+            self.pending[key] = [when, when, count, full]
 
     def _scan_titles(self):
         titles, method = _ai_window_titles()
@@ -1580,12 +1582,16 @@ class AIWatcher:
             if h in self.clip_seen:
                 continue
             self.clip_seen.add(h)
-            self._add("clipboard", "copied text", _clip_snippet(t) + " …", now)
+            self._add("clipboard", "copied text", _clip_snippet(t) + " …", now, full=t.strip())
 
     def _post(self):
-        events = [{"source": s, "service": svc, "evidence": ev,
-                   "first": int(f), "last": int(l), "count": c}
-                  for (s, svc, ev), (f, l, c) in self.pending.items()]
+        events = []
+        for (s, svc, ev), v in self.pending.items():
+            f, l, c, full = v[0], v[1], v[2], (v[3] if len(v) > 3 else "")
+            d = {"source": s, "service": svc, "evidence": ev, "first": int(f), "last": int(l), "count": c}
+            if full:
+                d["full"] = full[:20000]   # full clipboard text, so the admin can read what was copied
+            events.append(d)
         payload = {"version": AGENT_VERSION, "platform": _platform_key(),
                    "since": int(self.since), "checks": dict(self.checks), "events": events}
         try:
@@ -1722,11 +1728,6 @@ def run_gui(cfg, conf_dir):
     level_combo.pack(side="left", padx=6)
     goto_btn = ttk.Button(practicebar, text="Go", state="disabled")  # command wired below
     goto_btn.pack(side="left")
-
-    # shown when the selected competition checks for AI-assistant use (integrity notice)
-    ai_note_var = tk.StringVar(value="")
-    ai_note = ttk.Label(root, textvariable=ai_note_var, foreground="#e0a33a",
-                        wraplength=640, justify="left", padding=(12, 0, 10, 0))
 
     frm = ttk.Frame(root, padding=10)
     frm.pack(fill="both", expand=True)
@@ -2006,14 +2007,7 @@ def run_gui(cfg, conf_dir):
         else:
             free_switch_var.set(False)
             practicebar.pack_forget()
-        if c.get("ai_check"):
-            ai_note_var.set("Integrity check: while you play this competition, the app checks for "
-                            "AI-assistant use (ChatGPT, Claude, Gemini, Copilot, and similar) and for "
-                            "copying the task text. Google Search is fine. Do your own work.")
-            ai_note.pack(anchor="w", fill="x", after=compbar)
-        else:
-            ai_note_var.set("")
-            ai_note.pack_forget()
+        # The AI check is silent: no notice is shown in the app (the instructor warns students).
         nm = c.get("name") or c.get("comp")
         status_var.set(f"Selected “{nm}”. Enter your Team ID and click Start.")
 

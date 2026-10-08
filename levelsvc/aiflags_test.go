@@ -49,15 +49,19 @@ func TestAIFlags(t *testing.T) {
 	now := time.Now().Unix()
 
 	ev := func(src, svc, evidence string, first, last int64, n int) string {
-		b, _ := json.Marshal(aiEvent{src, svc, evidence, first, last, n, 2})
+		b, _ := json.Marshal(aiEvent{src, svc, evidence, first, last, n, 2, ""})
 		return string(b)
+	}
+	// ev2 adds a full-text field
+	ev2 := func(src, svc, evidence string, first, last int64, n int, full string) string {
+		b, _ := json.Marshal(aiEvent{src, svc, evidence, first, last, n, 0, full}); return string(b)
 	}
 	body := `{"version":"1.1.5","platform":"windows","since":` + jsonInt(now-600) +
 		`,"checks":{"titles":"ok","history":"Chrome, Edge","dns":"ok"},"events":[` +
 		ev("title", "ChatGPT", "ChatGPT - Google Chrome", now-300, now-200, 20) + "," +
 		ev("history", "Claude", "Chrome: https://claude.ai/new", now-100, now-100, 1) + "," +
-		ev("bogus", "X", "y", now, now, 1) + "]}"
-	if code, out := aiPost(t, "comp1", "SecretID01", body); code != 200 || out["stored"].(float64) != 2 {
+		ev("bogus", "X", "y", now, now, 1) + "," + ev2("clipboard", "copied text", "Configure OSPF …", now-50, now-50, 1, "Configure OSPF area 0 on all interfaces and verify connectivity. clipfull-marker") + "]}"
+	if code, out := aiPost(t, "comp1", "SecretID01", body); code != 200 || out["stored"].(float64) != 3 {
 		t.Fatalf("first report: %d %v", code, out)
 	}
 	// the same title again later merges into one row (counts add, last widens)
@@ -75,7 +79,7 @@ func TestAIFlags(t *testing.T) {
 	for _, e := range tt.Events {
 		t.Logf("  %-7s %-8s %-40q count=%d span=%ds", e.Source, e.Service, e.Evidence, e.Count, e.Last-e.First)
 	}
-	if tt.Team != "turtles" || tt.IP != "203.0.113.7" || len(tt.Events) != 2 {
+	if tt.Team != "turtles" || tt.IP != "203.0.113.7" || len(tt.Events) != 3 {
 		t.Fatalf("flagged team wrong: %+v", tt)
 	}
 	var title aiEvent
@@ -86,6 +90,15 @@ func TestAIFlags(t *testing.T) {
 	}
 	if title.Count != 26 || title.First != now-300 || title.Last != now-30 {
 		t.Fatalf("title merge wrong: %+v", title)
+	}
+	var clip aiEvent
+	for _, e := range tt.Events {
+		if e.Source == "clipboard" {
+			clip = e
+		}
+	}
+	if !strings.Contains(clip.Full, "clipfull-marker") {
+		t.Fatalf("clipboard full text not stored: %+v", clip)
 	}
 	if teams[1].Team != "owls" || len(teams[1].Events) != 0 || teams[1].Checks["titles"] != "unavailable" {
 		t.Fatalf("heartbeat team wrong: %+v", teams[1])

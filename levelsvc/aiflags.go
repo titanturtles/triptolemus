@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	aiMaxBody    = 64 << 10 // bytes per report
-	aiMaxEvents  = 100      // events per report
-	aiMaxPerTeam = 400      // distinct (signal, service, evidence) rows kept per team
+	aiMaxBody    = 512 << 10 // bytes per report (clipboard full-text can be large)
+	aiMaxEvents  = 100       // events per report
+	aiMaxPerTeam = 400       // distinct (signal, service, evidence) rows kept per team
 )
 
 var aiSources = map[string]bool{"title": true, "history": true, "dns": true, "clipboard": true, "process": true}
@@ -36,6 +36,7 @@ type aiEvent struct {
 	Last     int64  `json:"last"`
 	Count    int    `json:"count"`
 	Level    int    `json:"level,omitempty"`
+	Full     string `json:"full,omitempty"` // full captured text (clipboard), when the snippet is truncated
 }
 
 type aiRecord struct {
@@ -192,6 +193,7 @@ func aiflagHandler(w http.ResponseWriter, r *http.Request) {
 	stored, dropped := 0, 0
 	for _, e := range in.Events {
 		src, svc, ev := clip(e.Source, 10), clip(e.Service, 40), clip(e.Evidence, 300)
+		full := clip(e.Full, 20000)
 		if !aiSources[src] || svc == "" {
 			continue
 		}
@@ -217,8 +219,11 @@ func aiflagHandler(w http.ResponseWriter, r *http.Request) {
 			if e.Level > 0 {
 				x.Level = e.Level
 			}
+			if full != "" {
+				x.Full = full
+			}
 		} else if len(rec.Events) < aiMaxPerTeam {
-			rec.Events[key] = &aiEvent{src, svc, ev, first, last, cnt, e.Level}
+			rec.Events[key] = &aiEvent{src, svc, ev, first, last, cnt, e.Level, full}
 		} else {
 			dropped++
 			continue
