@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.9"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.10"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -796,12 +796,17 @@ class Competition:
 
     def switch_level(self, n):
         """Practice only: jump to a chosen level. Saves + uploads the level being left (so
-        every level is reviewable), then opens the chosen one, keeping the scoring loop running."""
+        every level is reviewable), then opens the chosen one, keeping the scoring loop running.
+        Always ends by reporting a state: the GUI disables every control while an action runs
+        ("busy") and only re-enables them on a "state" message — without it, Save / Stop /
+        Finish stayed greyed out after the first jump."""
         if not self.client:
             self.report("error", "Click Start first, then you can jump between levels.")
+            self.report("state", "idle")
             return
         if n == self.current:
             self.report("status", f"Already on level {n}.")
+            self.report("state", "running")
             return
         try:
             self._save(progress=True, final=True)   # preserve the level you're leaving
@@ -815,6 +820,7 @@ class Competition:
         except Exception as e:
             self.report("log", f"Could not switch to level {n}: {e}")
             self.report("error", f"Could not switch to level {n}:\n\n{e}")
+        self.report("state", "running")   # the scoring loop keeps running either way
 
     def restart_all(self):
         """Erase this team's scores + progress for the whole competition on the server, then
