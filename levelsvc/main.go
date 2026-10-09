@@ -79,6 +79,7 @@ type Competition struct {
 	Private      bool     `json:"private,omitempty"`      // when true, only AllowedTeams can see it (absent = public)
 	AllowedTeams []string `json:"allowedTeams,omitempty"` // team IDs with early (pre-release) visibility
 	AICheck      bool     `json:"aiCheck,omitempty"`      // agents report AI-assistant use while a level runs (aiflags.go)
+	Unit         int      `json:"unit,omitempty"`         // course unit a practice belongs to (scoreboard groups practices by it)
 	Levels       []Level  `json:"levels"`
 }
 
@@ -540,17 +541,87 @@ func adminCompetitions(w http.ResponseWriter, r *http.Request) {
 	c := snapshot()
 	list := []map[string]interface{}{}
 	for _, cp := range c.Competitions {
+		// per-level labels for the scoreboard's Practice pages (never keys/hashes)
+		info := []map[string]interface{}{}
+		for _, l := range cp.Levels {
+			info = append(info, map[string]interface{}{"level": l.Level, "name": l.Name, "image": l.Image, "threshold": l.Threshold})
+		}
 		list = append(list, map[string]interface{}{
 			"id": cp.ID, "name": cp.Name, "hidden": cp.Hidden, "default": cp.Default,
 			"practice": cp.Practice, "private": cp.Private, "allowedTeams": cp.AllowedTeams,
 			"levels": len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
 			"aiCheck": cp.AICheck, "aiFlagged": countAIFlagged(c, cp.ID),
+			"unit": cp.Unit, "levelInfo": info,
 		})
 	}
 	writeJSON(w, map[string]interface{}{"competitions": list})
 }
 
-var imgLine = regexp.MustCompile(`^\s*(\[\[image\]\]|name\s*=|color\s*=|password\s*=|#|$)`)
+// formUnit reads the optional "unit" form field (a practice's course unit).
+func formUnit(r *http.Request) (int, bool) {
+	s := strings.TrimSpace(r.FormValue("unit"))
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// adminSyncImages writes the sarpedon [[image]] blocks of competitions created with
+// deferImages (or repairs missing ones): ?comp=a,b,... (every competition if empty).
+// Blocks already in sarpedon.conf are skipped, so it is safe to repeat; everything goes
+// in ONE append, i.e. one sarpedon restart via its conf watcher.
+func adminSyncImages(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if !admin(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	want := map[string]bool{}
+	for _, id := range strings.Split(r.FormValue("comp"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			want[id] = true
+		}
+	}
+	c := snapshot()
+	if c.SarpConf == "" {
+		http.Error(w, "no sarpConf configured", 500)
+		return
+	}
+	var b strings.Builder
+	n := 0
+	for _, cp := range c.Competitions {
+		if len(want) > 0 && !want[cp.ID] {
+			continue
+		}
+		for _, l := range cp.Levels {
+			if l.Image == "" || l.Password == "" {
+				continue
+			}
+			b.WriteString(imageBlock(l.Image, l.Password, cp.Practice))
+			n++
+		}
+	}
+	added := 0
+	if b.Len() > 0 {
+		var err error
+		if added, err = appendSarpImages(b.String(), c.SarpConf); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	log.Printf("syncimages: %d candidate blocks, %d added", n, added)
+	writeJSON(w, map[string]interface{}{"status": "OK", "candidates": n, "images_added": added})
+}
+
+var imgLine = regexp.MustCompile(`^\s*(\[\[image\]\]|name\s*=|color\s*=|password\s*=|practice\s*=\s*(true|false)\s*$|#|$)`)
 var nameRe = regexp.MustCompile(`name\s*=\s*"([^"]+)"`)
 
 func appendSarpImages(blocks, sarpConf string) (int, error) {
@@ -1026,8 +1097,14 @@ func slugImage(comp string, level int, filename string) string {
 	return strings.Trim(img, "-")
 }
 
-func imageBlock(image, key string) string {
-	return fmt.Sprintf("[[image]]\nname = %q\ncolor = \"#1BA0E2\"\npassword = %q\n\n", image, key)
+// imageBlock is one sarpedon [[image]] entry. Practice levels carry `practice = true`
+// so sarpedon keeps them out of the main leaderboard and lists them on its Practice page.
+func imageBlock(image, key string, practice bool) string {
+	tag := ""
+	if practice {
+		tag = "practice = true\n"
+	}
+	return fmt.Sprintf("[[image]]\nname = %q\ncolor = \"#1BA0E2\"\npassword = %q\n%s\n", image, key, tag)
 }
 
 // pkaHash shells out to pka_tool -pass to read an activity's stored password hash;
@@ -1079,6 +1156,11 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 	allowed := parseTeamList(r.FormValue("allowedTeams"))
 	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
 	aiCheck := r.FormValue("aiCheck") != ""
+	unit, hasUnit := formUnit(r)
+	// deferImages: register the competition but leave sarpedon.conf alone; a later
+	// /admin/syncimages writes every pending [[image]] block at once (one sarpedon
+	// restart for a bulk import instead of one per competition).
+	deferImages := r.FormValue("deferImages") != ""
 	c := snapshot()
 	dir := filepath.Join(c.FilesDir, comp)
 	os.MkdirAll(dir, 0755)
@@ -1116,7 +1198,7 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		newLevels = append(newLevels, Level{Level: i, Name: lvName, Image: image, Threshold: thr,
 			File: fn, Password: key, PtPassword: hash})
-		sarpBlocks.WriteString(imageBlock(image, key))
+		sarpBlocks.WriteString(imageBlock(image, key, practice))
 	}
 	if len(newLevels) == 0 {
 		http.Error(w, "upload at least one .pka (field level1, level2, ...)", 400)
@@ -1136,18 +1218,21 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 			if hasAI {
 				cfg.Competitions[i].AICheck = aiCheck
 			}
+			if hasUnit {
+				cfg.Competitions[i].Unit = unit
+			}
 			cfg.Competitions[i].Levels = newLevels
 			found = true
 		}
 	}
 	if !found {
-		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, AICheck: aiCheck, Levels: newLevels})
+		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, AICheck: aiCheck, Unit: unit, Levels: newLevels})
 	}
 	persistLocked()
 	cfgMu.Unlock()
 
 	imgs := 0
-	if c.SarpConf != "" {
+	if c.SarpConf != "" && !deferImages {
 		if n, err := appendSarpImages(sarpBlocks.String(), c.SarpConf); err == nil {
 			imgs = n
 		} else {
@@ -1183,6 +1268,7 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	allowed := parseTeamList(r.FormValue("allowedTeams"))
 	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
 	aiCheck := r.FormValue("aiCheck") != ""
+	unit, hasUnit := formUnit(r)
 	if comp == "" {
 		http.Error(w, "comp required", 400)
 		return
@@ -1243,7 +1329,7 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 				lvName = fmt.Sprintf("Level %d", k)
 			}
 			newLevels = append(newLevels, Level{Level: k, Name: lvName, Image: image, Threshold: thr, File: fn, Password: key, PtPassword: hash})
-			sarpBlocks.WriteString(imageBlock(image, key))
+			sarpBlocks.WriteString(imageBlock(image, key, practice))
 		} else if ex, ok := byImage[keep]; ok {
 			ex.Level = k
 			ex.Threshold = thr
@@ -1270,6 +1356,9 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			if hasAI {
 				cfg.Competitions[i].AICheck = aiCheck
+			}
+			if hasUnit {
+				cfg.Competitions[i].Unit = unit
 			}
 			cfg.Competitions[i].Levels = newLevels
 		}
@@ -1728,6 +1817,7 @@ func main() {
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)
 	http.HandleFunc("/admin/create", adminCreate)
+	http.HandleFunc("/admin/syncimages", adminSyncImages)
 	http.HandleFunc("/admin/update", adminUpdate)
 	http.HandleFunc("/admin/competition", adminCompetition)
 	http.HandleFunc("/admin/submissions", adminSubmissions)
