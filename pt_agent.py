@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.10"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.11"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -52,6 +52,21 @@ def _encrypt(password: str, plaintext: bytes) -> str:
     nonce = os.urandom(12)
     ct = AESGCM(key).encrypt(nonce, plaintext, None)
     return (nonce + ct).hex()
+
+
+OPENED_ITEM = "Opened the activity (no graded items)"
+
+
+def effective_score(percent, items_done, items_total, items):
+    """Some activities grade nothing (explore / investigate / demonstration): after a
+    successful read Packet Tracer reports 0 assessment items, so they could never be
+    cleared. For those, opening the activity is the whole task -> report it complete as
+    one 1-point item (1/1 = 100%). A locked activity whose password is rejected raises in
+    read_activity instead of reading 0, so this never fires on an unlock failure.
+    Returns (percent, items_done, items_total, items, opened_only)."""
+    if int(items_total) == 0:
+        return 100.0, 1, 1, [{"name": OPENED_ITEM, "points": 1, "earned": True}], True
+    return percent, items_done, items_total, items, False
 
 
 def build_update(password, team, image, percent, items_done, items_total, items=None) -> str:
@@ -579,6 +594,7 @@ class Competition:
         self.ai_check = bool(cfg.get("ai_check", False))  # competition asks agents to check for AI use
         self.ai_watch = None          # AIWatcher while a level is running (if ai_check)
         self.free_switch = False      # practice "unlock all": disables auto-advance, allows jumps
+        self.opened_noted = set()     # levels already told "no graded items -> complete on open"
         self.levels = LevelsClient(cfg["levelsvc"])
         self.tmp = None
         self.current = None           # level number currently open in PT
@@ -714,6 +730,11 @@ class Competition:
                     with self.io_lock:
                         _title, pct, done, total = self.client.read_activity(lc.get("pt_password"))
                         items = self.client.read_items()
+                    pct, done, total, items, opened_only = effective_score(pct, done, total, items)
+                    if opened_only and self.current not in self.opened_noted:
+                        self.opened_noted.add(self.current)
+                        self.report("log", f"Level {self.current} has no graded items in Packet Tracer — "
+                                           "it counts as complete now that you've opened it.")
                     live_pct = pct
                     upd = build_update(lc["password"], self.team, lc["image"], pct, done, total, items)
                     code = post_update(self.cfg["remote"], upd)
