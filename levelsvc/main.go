@@ -5,7 +5,8 @@
 // (each a sarpedon image + clear-% + .pka). A level is released to a team only
 // once it cleared the previous level, read from sarpedon's Mongo `scores`.
 //
-//	GET  /status?comp=C&team=T          per-level score/cleared/unlocked (+ hidden)
+//	GET  /status?comp=C&team=T          per-level score/cleared/unlocked (+ hidden, + each
+//	                                    cleared level's completion message; levelmsg.go)
 //	GET  /level?comp=C&team=T&n=N        the level-N .pka iff unlocked (else 403)
 //	POST /upload?comp=C&team=T&n=N       store a finished .pka for review
 //	--- admin (header X-Admin-Token) ---
@@ -330,6 +331,7 @@ type levelStatus struct {
 	Score     int    `json:"score"`
 	Cleared   bool   `json:"cleared"`
 	Unlocked  bool   `json:"unlocked"`
+	Message   string `json:"message,omitempty"` // completion message, only once cleared (statusHandler)
 }
 
 func computeStatus(team string, levels []Level, practice bool) (int, []levelStatus) {
@@ -343,7 +345,8 @@ func computeStatus(team string, levels []Level, practice bool) (int, []levelStat
 		if unlocked && l.Level > maxUnlocked {
 			maxUnlocked = l.Level
 		}
-		out = append(out, levelStatus{l.Level, l.Image, l.Threshold, score, cleared, unlocked})
+		out = append(out, levelStatus{Level: l.Level, Image: l.Image, Threshold: l.Threshold,
+			Score: score, Cleared: cleared, Unlocked: unlocked})
 		prevCleared = prevCleared && cleared
 	}
 	return maxUnlocked, out
@@ -374,6 +377,11 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	unlocked, levels := computeStatus(team, cp.Levels, cp.Practice)
+	for i := range levels {
+		if levels[i].Cleared {
+			levels[i].Message = completeMessage(c.PkaTool, filepath.Join(c.FilesDir, cp.ID, cp.Levels[i].File))
+		}
+	}
 	writeJSON(w, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "team": team,
 		"practice": cp.Practice, "ai_check": cp.AICheck, "unlocked": unlocked, "levels": levels})
 }
@@ -1836,6 +1844,7 @@ func main() {
 		log.Fatalf("mongo ping: %v", err)
 	}
 	scores = client.Database(cfg.DBName).Collection("scores")
+	go warmCompleteMessages(snapshot())
 
 	http.HandleFunc("/status", statusHandler)
 	http.HandleFunc("/level", levelHandler)

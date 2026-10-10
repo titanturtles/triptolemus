@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.12"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.13"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -587,7 +587,8 @@ def reset_local(base_dir):
 class Competition:
     """Drives one competition. The GUI calls start()/stop()/finish(); a scoring-loop
     thread posts live scores and auto-advances levels. report(kind, payload) kinds:
-    'log','status','cards','error','state'. state payloads: 'idle','running','paused','done'."""
+    'log','status','cards','error','state','message'. state payloads: 'idle','running','paused','done'.
+    message payloads: {'level', 'text', 'popup'} — a cleared level's completion message."""
     def __init__(self, cfg, team_id, report, cancel):
         self.cfg = cfg
         self.team = team_id
@@ -600,6 +601,8 @@ class Competition:
         self.ai_watch = None          # AIWatcher while a level is running (if ai_check)
         self.free_switch = False      # practice "unlock all": disables auto-advance, allows jumps
         self.opened_noted = set()     # levels already told "no graded items -> complete on open"
+        self.messages = {}            # level -> completion message already passed to the GUI
+        self.messages_primed = False  # first status seen; later messages are new clears (popup)
         self.levels = LevelsClient(cfg["levelsvc"])
         self.tmp = None
         self.current = None           # level number currently open in PT
@@ -699,6 +702,21 @@ class Competition:
         src = "your saved progress" if got else "a fresh copy"
         self.report("log", f"Level {lvl} loaded in Packet Tracer ({src}). Go!")
 
+    def _note_messages(self, levels):
+        """Pass each cleared level's completion message (e.g. a password for the next round) to
+        the GUI once. Packet Tracer only shows it under Check Results, and the agent moves on to
+        the next level right away, so the student would otherwise miss it. Levels already
+        cleared when the loop starts are listed without a popup; competitions pop up new ones."""
+        for l in levels:
+            n, text = l.get("level"), (l.get("message") or "").strip()
+            if not l.get("cleared") or not text or self.messages.get(n) == text:
+                continue
+            self.messages[n] = text
+            self.report("log", f"Level {n} message: {text}")
+            self.report("message", {"level": n, "text": text,
+                                    "popup": self.messages_primed and not self.practice})
+        self.messages_primed = True
+
     def _loop(self):
         interval = int(self.cfg.get("interval", 10))
         while not self.loop_stop.is_set() and not self.cancel.is_set():
@@ -709,6 +727,7 @@ class Competition:
                 self.loop_stop.wait(interval)
                 continue
             levels = st.get("levels", [])
+            self._note_messages(levels)
             active = next((l for l in levels if l.get("unlocked") and not l.get("cleared")), None)
 
             # a level just cleared -> advance to the newly-unlocked one (fresh copy).
@@ -1502,6 +1521,11 @@ def _clipboard_texts():
     return texts, method
 
 
+# Completion messages the app has shown (and may copy for the student). The AI check's
+# clipboard scan ignores them: copying a password from the app isn't AI use.
+SHOWN_MESSAGES = set()
+
+
 def _looks_like_description(t):
     """A large block of prose (the task description), not a single command, IP or password."""
     t = (t or "").strip()
@@ -1610,7 +1634,7 @@ class AIWatcher:
         self.checks["clipboard"] = method if method not in ("win32",) else "ok"
         now = time.time()
         for t in texts:
-            if not _looks_like_description(t):
+            if not _looks_like_description(t) or t.strip() in SHOWN_MESSAGES:
                 continue
             h = hash(t)
             if h in self.clip_seen:
@@ -1774,6 +1798,9 @@ def run_gui(cfg, conf_dir):
     cards_frame = ttk.LabelFrame(frm, text="Levels", padding=8)
     cards_frame.grid(row=1, column=0, columnspan=3, sticky="we", pady=8)
     level_rows = {}
+    level_frames = {}   # level -> its card row (a completion message goes right under it)
+    level_names = {}
+    msg_boxes = {}
 
     status_var = tk.StringVar(value="Idle. Open Packet Tracer, then enter your Team ID and Start.")
     ttk.Label(frm, textvariable=status_var, foreground="#2f5e97").grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
@@ -1818,11 +1845,15 @@ def run_gui(cfg, conf_dir):
         for w in cards_frame.winfo_children():
             w.destroy()
         level_rows.clear()
+        level_frames.clear()
+        level_names.clear()
+        msg_boxes.clear()
         for lc in levels:
             n = int(lc["level"])
             label = lc.get("name") or f"Level {n}"
             row = ttk.Frame(cards_frame)
             row.pack(fill="x", pady=2)
+            level_frames[n], level_names[n] = row, label
             ttk.Label(row, text=label, width=26, font=("TkDefaultFont", 10, "bold")).pack(side="left")
             sv = tk.StringVar(value="… ready" if n == 1 else "🔒 locked")
             lbl = ttk.Label(row, textvariable=sv, foreground="#888")
@@ -1830,6 +1861,67 @@ def run_gui(cfg, conf_dir):
             level_rows[n] = (sv, lbl)
         if not levels:
             ttk.Label(cards_frame, text="(no competition selected)", foreground="#999").pack(anchor="w")
+
+    def copy_text(text):
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        status_var.set("Copied the message to the clipboard.")
+
+    def popup_message(n, text):
+        name = level_names.get(n) or f"Level {n}"
+        win = tk.Toplevel(root)
+        win.title(f"{name} cleared")
+        ttk.Label(win, text=f"{name} cleared! Message from the activity:",
+                  font=("TkDefaultFont", 10, "bold"), padding=(14, 12, 14, 6)).pack(anchor="w")
+        box = tk.Text(win, width=56, height=min(8, max(2, -(-len(text) // 48) + text.count("\n"))), wrap="word",
+                      font=("TkDefaultFont", 12, "bold"), background="#fff4d6", relief="flat",
+                      padx=10, pady=8)
+        box.insert("1.0", text)
+        box.configure(state="disabled")   # read-only but still selectable
+        box.pack(fill="both", expand=True, padx=14)
+        ttk.Label(win, text="It also stays under the level in the main window.", foreground="#666",
+                  padding=(14, 6, 14, 0)).pack(anchor="w")
+        bb = ttk.Frame(win, padding=(14, 8, 14, 12))
+        bb.pack(fill="x")
+        ttk.Button(bb, text="Copy", command=lambda: copy_text(text)).pack(side="left")
+        ttk.Button(bb, text="OK", command=win.destroy).pack(side="right")
+        # over the main window, and above Packet Tracer, which just opened the next level
+        win.update_idletasks()
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - win.winfo_reqwidth()) // 2)
+        win.geometry(f"+{max(0, x)}+{max(0, root.winfo_rooty() + 120)}")
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+        root.bell()
+
+    def maximized():
+        try:
+            return root.state() == "zoomed" or bool(root.attributes("-zoomed"))
+        except Exception:
+            return False
+
+    def show_message(n, text, popup):
+        """A cleared level's completion message (e.g. the password for the next round), kept
+        under its level card; popup also opens it in its own window."""
+        SHOWN_MESSAGES.add(text)
+        old = msg_boxes.pop(n, None)
+        if old:
+            old.destroy()
+        if n in level_frames:
+            box = tk.Frame(cards_frame, background="#fff4d6", padx=8, pady=6)
+            box.pack(fill="x", pady=(0, 4), after=level_frames[n])
+            ttk.Button(box, text="Copy", command=lambda: copy_text(text)).pack(side="right", padx=(8, 0))
+            tk.Label(box, text=text, background="#fff4d6", justify="left", anchor="w", wraplength=520,
+                     font=("TkDefaultFont", 10, "bold")).pack(side="left", fill="x", expand=True)
+            msg_boxes[n] = box
+            if not old and not maximized():
+                # grow the window by the box so the log keeps its space
+                root.update_idletasks()
+                h = min(root.winfo_height() + box.winfo_reqheight() + 4, root.winfo_screenheight() - 80)
+                if h > root.winfo_height():
+                    root.geometry(f"{root.winfo_width()}x{h}")
+        if popup:
+            popup_message(n, text)
 
     cancel = threading.Event()
     comp = {"obj": None}
@@ -2099,6 +2191,8 @@ def run_gui(cfg, conf_dir):
                     status_var.set(payload)
                 elif kind == "cards":
                     render_cards(payload)
+                elif kind == "message":
+                    show_message(payload["level"], payload["text"], payload.get("popup"))
                 elif kind == "error":
                     try:
                         messagebox.showerror("Packet Tracer", payload)
@@ -2146,6 +2240,8 @@ def run_gui(cfg, conf_dir):
                   "level choices:", list(LEVELPICK.keys()), "free_switch:", free_switch_var.get())
         render_cards({"levels": [{"level": 1, "unlocked": True, "cleared": True},
                                  {"level": 2, "unlocked": True, "cleared": False}], "active": 2, "pct": 42})
+        if os.environ.get("PT_AGENT_SELFTEST_MESSAGE"):   # arrives once the window is up, like a real clear
+            root.after(1200, lambda: show_message(1, os.environ["PT_AGENT_SELFTEST_MESSAGE"], True))
         if os.environ.get("PT_AGENT_GEOCHECK"):
             root.update_idletasks()
             root.update()
@@ -2157,7 +2253,7 @@ def run_gui(cfg, conf_dir):
                 x, w = b.winfo_rootx() - root.winfo_rootx(), b.winfo_width()
                 vis = "OK" if (x >= 0 and x + w <= ww and w > 1) else "CLIPPED"
                 print(f"[geo] {nm:10s} x={x:4d} w={w:4d} text='{b.cget('text')}' -> {vis}")
-        root.after(1500, on_close)
+        root.after(int(os.environ.get("PT_AGENT_SELFTEST_MS", 1500)), on_close)
 
     root.mainloop()
 
