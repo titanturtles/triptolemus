@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -138,5 +140,116 @@ func TestPracticeDeferredImagesAndSync(t *testing.T) {
 	adminSyncImages(w, req)
 	if w.Code != 401 {
 		t.Fatalf("syncimages without token: %d", w.Code)
+	}
+}
+
+// TestPracticeDeferredUpdateInsert: insert a new level ahead of a kept one with
+// deferImages — the kept level keeps its image/key, nothing touches sarpedon.conf until
+// syncimages, which then adds only the new (practice-tagged) block.
+func TestPracticeDeferredUpdateInsert(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "sarpedon.conf")
+	os.WriteFile(conf, []byte("[[team]]\nid = \"X\"\nalias = \"x\"\n"), 0644)
+	confPath = filepath.Join(dir, "levels.json")
+	cfg = Config{AdminToken: "a", SarpConf: conf, FilesDir: filepath.Join(dir, "levels")}
+	post := func(h func(w http.ResponseWriter, r *http.Request), path string, fields map[string]string, files map[string]string) map[string]interface{} {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for k, v := range fields {
+			mw.WriteField(k, v)
+		}
+		for field, fn := range files {
+			fw, _ := mw.CreateFormFile(field, fn)
+			fw.Write([]byte("pka " + fn))
+		}
+		mw.Close()
+		req := httptest.NewRequest("POST", path, &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("X-Admin-Token", "a")
+		w := httptest.NewRecorder()
+		h(w, req)
+		if w.Code != 200 {
+			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+		var o map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &o)
+		return o
+	}
+	post(adminCreate, "/admin/create", map[string]string{"name": "U4.M13. VLANs", "comp": "p13", "practice": "1", "unit": "4",
+		"deferImages": "1", "levelname1": "13.3.12 VLAN Configuration"}, map[string]string{"level1": "13-3-12-vlan.pka"})
+	post(adminSyncImages, "/admin/syncimages?comp=p13", nil, nil)
+	before := snapshot().Competitions[0].Levels[0]
+	base, _ := os.ReadFile(conf)
+
+	// insert 13.1.4 as the new L1; keep the old level as L2 (renumbered, same image + key)
+	o := post(adminUpdate, "/admin/update", map[string]string{"comp": "p13", "name": "U4.M13. VLANs", "practice": "1", "unit": "4",
+		"deferImages": "1", "levelname1": "13.1.4 Who Hears the Broadcast", "keep2": before.Image, "levelname2": before.Name},
+		map[string]string{"level1": "13-1-4-who-hears.pka"})
+	if o["images_added"].(float64) != 0 || o["levels"].(float64) != 2 {
+		t.Fatalf("deferred update: %v", o)
+	}
+	if got, _ := os.ReadFile(conf); string(got) != string(base) {
+		t.Fatalf("deferred update touched sarpedon.conf")
+	}
+	lv := snapshot().Competitions[0].Levels
+	if lv[1].Level != 2 || lv[1].Image != before.Image || lv[1].Password != before.Password || lv[0].Name != "13.1.4 Who Hears the Broadcast" {
+		t.Fatalf("levels after insert: %+v", lv)
+	}
+	if o := post(adminSyncImages, "/admin/syncimages?comp=p13", nil, nil); o["images_added"].(float64) != 1 {
+		t.Fatalf("sync after update should add only the new block: %v", o)
+	}
+	got, _ := os.ReadFile(conf)
+	if strings.Count(string(got), "practice = true") != 2 || !strings.Contains(string(got), `"`+lv[0].Image+`"`) {
+		t.Fatalf("sarpedon.conf after sync:\n%s", got)
+	}
+}
+
+// TestUniqueImageNames: long similar file names truncate to the same 60-char image name
+// ("… exploration part 1/2/3"); every level must still get its own image (sarpedon keys
+// scoring by it), on create and when an update inserts a level.
+func TestUniqueImageNames(t *testing.T) {
+	taken := map[string]bool{}
+	a := uniqueImage("p21-x-L8-21-7-3-multiarea-ospf-exploration-part-1-physical-m", taken)
+	b := uniqueImage("p21-x-L8-21-7-3-multiarea-ospf-exploration-part-1-physical-m", taken)
+	c := uniqueImage("p21-x-L8-21-7-3-multiarea-ospf-exploration-part-1-physical-m", taken)
+	if a == b || b == c || a == c || len(b) > 60 || len(c) > 60 {
+		t.Fatalf("uniqueImage: %q %q %q", a, b, c)
+	}
+
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "sarpedon.conf")
+	os.WriteFile(conf, []byte(""), 0644)
+	confPath = filepath.Join(dir, "levels.json")
+	cfg = Config{AdminToken: "a", SarpConf: conf, FilesDir: filepath.Join(dir, "levels")}
+	long := "21-7-3-multiarea-ospf-exploration-part-%d-physical-mode.pka"
+	body, ct := createForm(t, map[string]string{"name": "OSPF", "comp": "p21-single-area-ospfv2-confi", "practice": "1", "deferImages": "1"},
+		[]string{fmt.Sprintf(long, 3)})
+	req := httptest.NewRequest("POST", "/admin/create", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Admin-Token", "a")
+	adminCreate(httptest.NewRecorder(), req)
+	old := snapshot().Competitions[0].Levels[0]
+
+	// insert Part 1 as L1 ahead of the kept Part 3 (which keeps its "L1" image name)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for k, v := range map[string]string{"comp": "p21-single-area-ospfv2-confi", "name": "OSPF", "practice": "1",
+		"deferImages": "1", "keep2": old.Image} {
+		mw.WriteField(k, v)
+	}
+	fw, _ := mw.CreateFormFile("level1", fmt.Sprintf(long, 1))
+	fw.Write([]byte("pka"))
+	mw.Close()
+	req = httptest.NewRequest("POST", "/admin/update", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Admin-Token", "a")
+	w := httptest.NewRecorder()
+	adminUpdate(w, req)
+	if w.Code != 200 {
+		t.Fatalf("update: %d %s", w.Code, w.Body.String())
+	}
+	lv := snapshot().Competitions[0].Levels
+	if len(lv) != 2 || lv[0].Image == lv[1].Image || lv[1].Image != old.Image || lv[1].Password != old.Password {
+		t.Fatalf("levels share an image or the kept one changed: %+v", lv)
 	}
 }

@@ -1087,6 +1087,38 @@ var keepChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
 // slugImage builds a human-readable image/file name from the uploaded .pka filename,
 // e.g. comp "test2", level 1, file "test2-L1-276.pka" -> "test2-L1-276".
+// takenImages: every image name in use, except (optionally) one competition's own -
+// sarpedon keys scoring by image name, so two levels must never share one.
+func takenImages(c Config, exceptComp string) map[string]bool {
+	t := map[string]bool{}
+	for _, cp := range c.Competitions {
+		if cp.ID == exceptComp {
+			continue
+		}
+		for _, l := range cp.Levels {
+			t[l.Image] = true
+		}
+	}
+	return t
+}
+
+// uniqueImage returns img, or img with -2, -3, ... (still <= 60 chars) if it is taken, and
+// marks the result taken. slugImage truncates to 60 chars, so long similar names (e.g.
+// "… Exploration - Part 1/2/3") can otherwise collide.
+func uniqueImage(img string, taken map[string]bool) string {
+	cand := img
+	for n := 2; taken[cand]; n++ {
+		suf := "-" + strconv.Itoa(n)
+		base := img
+		if len(base)+len(suf) > 60 {
+			base = strings.Trim(base[:60-len(suf)], "-")
+		}
+		cand = base + suf
+	}
+	taken[cand] = true
+	return cand
+}
+
 func slugImage(comp string, level int, filename string) string {
 	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 	base = keepChars.ReplaceAllString(strings.ReplaceAll(base, " ", "-"), "")
@@ -1162,6 +1194,7 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 	// restart for a bulk import instead of one per competition).
 	deferImages := r.FormValue("deferImages") != ""
 	c := snapshot()
+	taken := takenImages(c, comp) // a re-create may reuse its own old names
 	dir := filepath.Join(c.FilesDir, comp)
 	os.MkdirAll(dir, 0755)
 
@@ -1179,7 +1212,7 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		data, _ := io.ReadAll(f)
 		f.Close()
-		image := slugImage(comp, i, fhs[0].Filename)
+		image := uniqueImage(slugImage(comp, i, fhs[0].Filename), taken)
 		fn := image + ".pka"
 		pkaPath := filepath.Join(dir, fn)
 		if err := os.WriteFile(pkaPath, data, 0644); err != nil {
@@ -1269,11 +1302,13 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
 	aiCheck := r.FormValue("aiCheck") != ""
 	unit, hasUnit := formUnit(r)
+	deferImages := r.FormValue("deferImages") != "" // like adminCreate: /admin/syncimages writes them later
 	if comp == "" {
 		http.Error(w, "comp required", 400)
 		return
 	}
 	c := snapshot()
+	taken := takenImages(c, "") // kept levels keep their names; new uploads must avoid them
 	byImage := map[string]Level{}
 	found := false
 	for _, cp := range c.Competitions {
@@ -1317,7 +1352,7 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			data, _ := io.ReadAll(f)
 			f.Close()
-			image := slugImage(comp, k, fhs[0].Filename)
+			image := uniqueImage(slugImage(comp, k, fhs[0].Filename), taken)
 			fn := image + ".pka"
 			if err := os.WriteFile(filepath.Join(dir, fn), data, 0644); err != nil {
 				http.Error(w, "cannot store level file: "+err.Error(), 500)
@@ -1366,7 +1401,7 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	persistLocked()
 	cfgMu.Unlock()
 	imgs := 0
-	if c.SarpConf != "" && sarpBlocks.Len() > 0 {
+	if c.SarpConf != "" && sarpBlocks.Len() > 0 && !deferImages {
 		if n, err := appendSarpImages(sarpBlocks.String(), c.SarpConf); err == nil {
 			imgs = n
 		}
