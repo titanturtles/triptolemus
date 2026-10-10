@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.11"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.1.12"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -432,12 +432,17 @@ class LevelsClient:
 
 
 # ---------------- OS helpers ----------------
+# The windowed Windows exe has no console, so every console tool it runs (taskkill, ipconfig,
+# tasklist) would flash its own cmd window; CREATE_NO_WINDOW runs them hidden.
+NO_WINDOW = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+
+
 def close_pt():
     """Terminate the Packet Tracer process (best-effort, cross-platform)."""
     try:
         if platform.system() == "Windows":
             subprocess.run(["taskkill", "/F", "/IM", "PacketTracer.exe"],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15, **NO_WINDOW)
         else:
             for pat in ("PacketTracer", "packettracer"):
                 subprocess.run(["pkill", "-f", pat], capture_output=True, timeout=15)
@@ -1333,7 +1338,8 @@ def _ai_dns_cache():
     if not sys.platform.startswith("win"):
         return []
     try:
-        out = subprocess.run(["ipconfig", "/displaydns"], capture_output=True, text=True, timeout=10)
+        out = subprocess.run(["ipconfig", "/displaydns"], capture_output=True, text=True, timeout=10,
+                             **NO_WINDOW)
     except Exception:
         return []
     hits = {}
@@ -1381,7 +1387,8 @@ def _list_processes():
     if sys.platform.startswith("win"):
         try:
             # image name + command line via WMIC (present on most Windows); fall back to tasklist
-            out = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=8)
+            out = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=8,
+                                 **NO_WINDOW)
             import csv, io
             for row in csv.reader(io.StringIO(out.stdout)):
                 if row:
