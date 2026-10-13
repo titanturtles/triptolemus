@@ -1,0 +1,146 @@
+{
+  "format": 1,
+  "os": "windows",
+  "title": "Week 1 Advanced: Accounts (Windows)",
+  "readme": "You administer this computer. A security review found account problems. Fix them without removing people the company needs.\n\nAuthorized users: alice, bob, carol, dave, frank.\nAuthorized administrators: you, and alice.\n\nCompany policy requires tidy accounts: only authorized people, only authorized admins, no unnecessary remote-desktop access, the Guest and built-in Administrator accounts disabled, a real minimum password length, and passwords never stored with reversible encryption.\n\nThere are 10 problems, 20 points each. Removing an authorized user is a penalty.",
+  "setup": "\n$ErrorActionPreference = 'Stop'\n# Baseline for Week 1 (Accounts) Advanced. Forces each problem into place.\nfunction New-Pw { (-join ((48..57)+(65..90)+(97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })) + 'Aa1!' }\nforeach ($u in 'alice','bob','carol','dave','frank','mallory','eve','ghost') {\n    $pw = ConvertTo-SecureString (New-Pw) -AsPlainText -Force\n    if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) { Set-LocalUser -Name $u -Password $pw }\n    else { New-LocalUser -Name $u -Password $pw -PasswordNeverExpires | Out-Null }\n    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $u -ErrorAction SilentlyContinue   # Users\n}\n# alice is the authorized administrator\nAdd-LocalGroupMember -SID 'S-1-5-32-544' -Member 'alice' -ErrorAction SilentlyContinue\n# 4-5) bob and carol should be normal users, not administrators\nAdd-LocalGroupMember -SID 'S-1-5-32-544' -Member 'bob' -ErrorAction SilentlyContinue\nAdd-LocalGroupMember -SID 'S-1-5-32-544' -Member 'carol' -ErrorAction SilentlyContinue\n# 6) dave does not need Remote Desktop\nAdd-LocalGroupMember -SID 'S-1-5-32-555' -Member 'dave' -ErrorAction SilentlyContinue   # Remote Desktop Users\n# 7) the Guest account is on. 8) the built-in Administrator is on.\nGet-LocalUser | Where-Object { $_.SID.Value -like '*-501' } | Enable-LocalUser\nGet-LocalUser | Where-Object { $_.SID.Value -like '*-500' } | Enable-LocalUser\n# 9) any password length is accepted\nnet accounts /minpwlen:0 | Out-Null\n# 10) passwords are stored with reversible encryption\n$inf = Join-Path $env:TEMP 'sp_setup.inf'\n@\"\n[Unicode]\nUnicode=yes\n[System Access]\nClearTextPassword = 1\n[Version]\nsignature=\"`$CHICAGO`$\"\n\"@ | Set-Content -Path $inf -Encoding Unicode\nsecedit /configure /db (Join-Path $env:TEMP 'sp.sdb') /cfg $inf /areas SECURITYPOLICY /quiet\n",
+  "checks": [
+    {
+      "message": "Removed the unauthorized user mallory",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "mallory"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized user eve",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "eve"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized user ghost",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "ghost"
+        }
+      ]
+    },
+    {
+      "message": "bob is no longer an administrator",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "bob"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "bob",
+          "group": "Administrators"
+        }
+      ]
+    },
+    {
+      "message": "carol is no longer an administrator",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "carol"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "carol",
+          "group": "Administrators"
+        }
+      ]
+    },
+    {
+      "message": "dave is no longer in Remote Desktop Users",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "dave"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "dave",
+          "group": "Remote Desktop Users"
+        }
+      ]
+    },
+    {
+      "message": "The Guest account is disabled",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "$g = Get-LocalUser | Where-Object { $_.SID.Value -like '*-501' }\nif ($g -and -not $g.Enabled) { exit 0 } else { exit 1 }"
+        }
+      ]
+    },
+    {
+      "message": "The built-in Administrator account is disabled",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "$a = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' }\nif ($a -and -not $a.Enabled) { exit 0 } else { exit 1 }"
+        }
+      ]
+    },
+    {
+      "message": "Passwords must be at least 8 characters",
+      "points": 20,
+      "pass": [
+        {
+          "type": "SecurityPolicy",
+          "key": "MinimumPasswordLength",
+          "min": 8
+        }
+      ]
+    },
+    {
+      "message": "Passwords are not stored with reversible encryption",
+      "points": 20,
+      "pass": [
+        {
+          "type": "SecurityPolicy",
+          "key": "ClearTextPassword",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user alice",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "alice"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user frank",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "frank"
+        }
+      ]
+    }
+  ]
+}

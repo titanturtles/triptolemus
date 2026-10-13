@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "os": "linux",
+  "title": "Week 1 Basic: Accounts (Linux)",
+  "readme": "You administer this workstation. A security review found account problems. Fix them without removing people the company needs.\n\nAuthorized users: alice, bob.\nAuthorized administrators: you (the account you log in with).\n\nCompany policy:\n  - Only authorized users may have accounts.\n  - Only authorized administrators may have sudo rights.\n  - Only real people's accounts may be used to log in (service accounts cannot).\n  - No leftover groups that policy doesn't call for.\n\nThere are 5 problems, 20 points each. Do not delete alice or bob.",
+  "setup": "\nset -e\n# Baseline for Week 1 (Accounts) Basic. Forces each problem into place so a hardened VM still\n# starts with all of them.\npw() { printf '%s' \"$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)Aa1!\"; }\nfor u in alice bob mallory eve; do\n    id \"$u\" >/dev/null 2>&1 || useradd -m -s /bin/bash \"$u\"\n    echo \"$u:$(pw)\" | chpasswd\ndone\n# 1-2) mallory and eve are unauthorized. 3) bob should be a normal user, not an admin.\nusermod -aG sudo bob\n# 4) an unauthorized group\ngetent group pirates >/dev/null || groupadd pirates\n# 5) the www-data service account can log in\nusermod -s /bin/bash www-data 2>/dev/null || true\n",
+  "checks": [
+    {
+      "message": "Removed the unauthorized user mallory",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "mallory"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized user eve",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "eve"
+        }
+      ]
+    },
+    {
+      "message": "bob is no longer an administrator",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "bob"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "bob",
+          "group": "sudo"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized group pirates",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "! getent group pirates >/dev/null"
+        }
+      ]
+    },
+    {
+      "message": "The www-data service account cannot log in",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "case \"$(getent passwd www-data | cut -d: -f7)\" in */nologin|*/false) exit 0;; *) exit 1;; esac"
+        }
+      ]
+    }
+  ]
+}

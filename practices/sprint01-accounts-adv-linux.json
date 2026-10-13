@@ -1,0 +1,139 @@
+{
+  "format": 1,
+  "os": "linux",
+  "title": "Week 1 Advanced: Accounts (Linux)",
+  "readme": "You administer this workstation. A security review found account problems. Fix them without removing people the company needs.\n\nAuthorized users: alice, bob, carol, dave, frank.\nAuthorized administrators: you, and alice.\n\nCompany policy requires tidy accounts: only authorized people, only authorized admins, no service-account logins, no stray groups, no shared or hidden privilege, and passwords kept current. Some problems are not obvious from the user list alone.\n\nThere are 10 problems, 20 points each. Removing an authorized user is a penalty.",
+  "setup": "\nset -e\n# Baseline for Week 1 (Accounts) Advanced. Forces each problem into place.\npw() { printf '%s' \"$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)Aa1!\"; }\nfor u in alice bob carol dave frank mallory eve ghost; do\n    id \"$u\" >/dev/null 2>&1 || useradd -m -s /bin/bash \"$u\"\n    echo \"$u:$(pw)\" | chpasswd\ndone\n# alice is the authorized administrator\nusermod -aG sudo alice\n# 1-3) mallory, eve, ghost are unauthorized. 4) a second account hijacking UID 0.\nid lgates >/dev/null 2>&1 || useradd -o -u 0 -g 0 -M lgates\necho \"lgates:$(pw)\" | chpasswd\n# 5-6) bob and carol should be normal users, not admins\nusermod -aG sudo bob\nusermod -aG sudo carol\n# 7) a real user left in the shadow group\nusermod -aG shadow bob\n# 8) the www-data service account can log in\nusermod -s /bin/bash www-data 2>/dev/null || true\n# 9) an unauthorized group\ngetent group pirates >/dev/null || groupadd pirates\n# 10) dave's password is old and not forced to change (reset the aging so the fix is needed)\nchage -d 20000 dave\n",
+  "checks": [
+    {
+      "message": "Removed the unauthorized user mallory",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "mallory"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized user eve",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "eve"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized user ghost",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "ghost"
+        }
+      ]
+    },
+    {
+      "message": "Removed the account hijacking UID 0",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "test -z \"$(awk -F: '$3==0 && $1!=\"root\"{print $1}' /etc/passwd)\""
+        }
+      ]
+    },
+    {
+      "message": "bob is no longer an administrator",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "bob"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "bob",
+          "group": "sudo"
+        }
+      ]
+    },
+    {
+      "message": "carol is no longer an administrator",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExists",
+          "user": "carol"
+        },
+        {
+          "type": "UserInGroupNot",
+          "user": "carol",
+          "group": "sudo"
+        }
+      ]
+    },
+    {
+      "message": "No ordinary user is in the shadow group",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "test -z \"$(getent group shadow | cut -d: -f4)\""
+        }
+      ]
+    },
+    {
+      "message": "The www-data service account cannot log in",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "case \"$(getent passwd www-data | cut -d: -f7)\" in */nologin|*/false) exit 0;; *) exit 1;; esac"
+        }
+      ]
+    },
+    {
+      "message": "Removed the unauthorized group pirates",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "! getent group pirates >/dev/null"
+        }
+      ]
+    },
+    {
+      "message": "dave must change their password at next login",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "test \"$(getent shadow dave | cut -d: -f3)\" = 0"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user alice",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "alice"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user frank",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "frank"
+        }
+      ]
+    }
+  ]
+}
