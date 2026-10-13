@@ -1,14 +1,16 @@
 # Fixes for sprint01-accounts-adv-windows (CI tests only; never uploaded to students).
 $ErrorActionPreference = 'Stop'
 Remove-LocalUser -Name 'mallory'
-Remove-LocalUser -Name 'eve'
-Remove-LocalUser -Name 'ghost'
+net user "sysadmin$" /delete | Out-Null
 Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'bob'
-Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'carol'
+Remove-LocalGroupMember -SID 'S-1-5-32-551' -Member 'carol'
 Remove-LocalGroupMember -SID 'S-1-5-32-555' -Member 'dave'
 Get-LocalUser | Where-Object { $_.SID.Value -like '*-501' } | Disable-LocalUser
 Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' } | Disable-LocalUser
-net accounts /minpwlen:12 | Out-Null
+$w = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+Set-ItemProperty -Path $w -Name AutoAdminLogon -Value '0'
+Remove-ItemProperty -Path $w -Name DefaultPassword -ErrorAction SilentlyContinue
+Set-LocalUser -Name 'bob' -PasswordNeverExpires $false
 $inf = Join-Path $env:TEMP 'sp_fix.inf'
 @"
 [Unicode]
