@@ -9,10 +9,11 @@ and posts the score to the scoreboard like a Cisco level. Students start from th
 The VM can't see its own snapshots, so before the first setup on a VM PT Comp asks whether there is
 a Clean snapshot (*Yes, start* / *Not yet, I'll take it now* / *Cancel*). It saves the answer on the
 VM before the student takes the snapshot, so the snapshot keeps it and a restored VM doesn't ask
-again. PT Comp tells the student to restore Clean when the VM isn't clean: a different practice
-is set up, or a setup failed or was interrupted (the marker is written as `setup` before the
-script runs and becomes `ready` only once it works). The tab shows the VM's state under the
-practice picker.
+again. When the VM isn't clean, Start says so: with the same practice already set up it offers
+*Continue where I left off* or *Start over* (= go back to Clean); with a different practice set
+up, or after a setup that failed or was interrupted (the marker is written as `setup` before the
+script runs and becomes `ready` only once it works), it shows how to go back to the Clean snapshot.
+The tab also shows the VM's state under the practice picker.
 
 | File | Problems |
 |---|---|

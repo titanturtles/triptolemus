@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.1"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.2"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -2839,24 +2839,27 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["levels_label"] = ttk.Label(f, textvariable=T["levels_var"], foreground="#555", wraplength=640)
         T["levels_label"].pack(anchor="w", pady=(2, 0))
         T["note"] = tk.Label(f, justify="left", anchor="w", wraplength=630, padx=8, pady=5)  # packed by vm_note
-        # packed bottom-up so the README (last) takes whatever height is left, and grows with the window
-        T["fixed"] = scrolledtext.ScrolledText(f, height=4, wrap="word", state="disabled", font=("TkDefaultFont", 9),
-                                               background="#f4faf5", relief="flat", padx=6, pady=4)
-        T["fixed"].tag_configure("penalty", foreground="#b3261e")
-        T["fixed"].pack(side="bottom", fill="x")
-        T["score_var"] = tk.StringVar(value="")
-        ttk.Label(f, textvariable=T["score_var"], font=("TkDefaultFont", 10, "bold"),
-                  foreground="#1b7f3b").pack(side="bottom", anchor="w", pady=(6, 0))
-        head = ttk.Frame(f)
-        head.pack(fill="x", pady=(6, 0))
+        # the README above, the score below, and a bar between them to drag; both grow with the window
+        split = tk.PanedWindow(f, orient="vertical", sashwidth=9, sashrelief="raised", opaqueresize=True,
+                               borderwidth=0, background="#b9c3cf")
+        split.pack(fill="both", expand=True, pady=(6, 0))
+        top, low = ttk.Frame(split), ttk.Frame(split)
+        head = ttk.Frame(top)
+        head.pack(fill="x")
         T["readme_title"] = tk.StringVar(value="README (shown once you Start)")
         ttk.Label(head, textvariable=T["readme_title"], font=("TkDefaultFont", 10, "bold")).pack(side="left")
-        T["readme_btn"] = ttk.Button(head, text="Open in a big window", state="disabled",
-                                     command=lambda: vm_readme_window(T))
-        T["readme_btn"].pack(side="right")
-        T["readme_text"] = ""
-        T["readme"] = scrolledtext.ScrolledText(f, height=3, wrap="word", state="disabled", font=("TkDefaultFont", 10))
+        ttk.Label(head, text="drag the bar below to resize ⇕", foreground="#777").pack(side="right")
+        T["readme"] = scrolledtext.ScrolledText(top, height=4, wrap="word", state="disabled", font=("TkDefaultFont", 10))
         T["readme"].pack(fill="both", expand=True)
+        T["score_var"] = tk.StringVar(value="")
+        ttk.Label(low, textvariable=T["score_var"], font=("TkDefaultFont", 10, "bold"),
+                  foreground="#1b7f3b").pack(anchor="w", pady=(4, 0))
+        T["fixed"] = scrolledtext.ScrolledText(low, height=3, wrap="word", state="disabled", font=("TkDefaultFont", 9),
+                                               background="#f4faf5", relief="flat", padx=6, pady=4)
+        T["fixed"].tag_configure("penalty", foreground="#b3261e")
+        T["fixed"].pack(fill="both", expand=True)
+        split.add(top, minsize=70, stretch="always")
+        split.add(low, minsize=60, stretch="always")
         T["combo"].bind("<<ComboboxSelected>>", lambda *_: vm_select(T))
         VM[kind] = T
         vm_set_state(T, "idle")
@@ -2902,6 +2905,38 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             "back the way it is now, to redo a practice or load a different one.\n\n"
             f"How: {TAKE_SNAPSHOT}\n\nDo you already have a Clean snapshot of this VM?"),
             [("yes", "Yes, start the practice"), ("later", "Not yet, I'll take it now"), (None, "Cancel")])
+
+    def go_back_to_clean(heading, why):
+        ask_choice("Go back to your Clean snapshot", heading,
+                   f"{why}\n\nHow: {RESTORE_SNAPSHOT}\n\nThen open PT Comp and click Start.", [("ok", "OK")])
+
+    def vm_dirty_ok(T, mark, c):
+        """Start on a VM that already has a practice set up (mark): True to continue that practice;
+        otherwise the student is told to go back to the Clean snapshot first."""
+        there = mark.get("title") or mark.get("comp")
+        ans = "back"
+        if marker_unfinished(mark):
+            go_back_to_clean("This VM isn't clean", f"Setting up “{there}” didn't finish, so this VM is only "
+                             "partly changed. Go back to your Clean snapshot before starting a practice.")
+        elif mark.get("comp") != c.get("comp"):
+            go_back_to_clean("This VM isn't clean", f"This VM already has “{there}” set up. To start "
+                             f"“{T['var'].get()}”, go back to your Clean snapshot first.")
+        else:
+            since = time.strftime(" on %b %d at %H:%M", time.localtime(mark["at"])) if mark.get("at") else ""
+            ans = ask_choice("Practice already set up", f"“{there}” is already set up on this VM", (
+                f"It was set up{since}, and everything you changed since then is still on this VM.\n\n"
+                "Continue where you left off, or start over? Starting over means going back to your Clean "
+                "snapshot first."),
+                [("continue", "Continue where I left off"), ("over", "Start over"), (None, "Cancel")])
+            if ans == "continue":
+                return True
+            if ans == "over":
+                go_back_to_clean("Start over from your Clean snapshot", "Going back to the Clean snapshot undoes "
+                                 "everything since the practice was set up; PT Comp then sets it up fresh.")
+        if ans:
+            status_var.set("Go back to your Clean snapshot, then click Start.")
+            logln("Not started: go back to your Clean snapshot first.")
+        return False
 
     def vm_note(T):
         """Under the practice picker: a reminder to take the Clean snapshot before the first practice,
@@ -2979,7 +3014,10 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             status_var.set("Pick a practice first (click Reload if the list is empty).")
             return
         save_state(conf_dir, {"team_id": team_id})
-        if T["here"] and not read_marker() and not snapshot_noted():   # about to change a clean VM
+        mark = read_marker() if T["here"] else None
+        if mark and not vm_dirty_ok(T, mark, c):   # this VM isn't clean: continue, or go back to Clean
+            return
+        if T["here"] and not mark and not snapshot_noted():   # about to change a clean VM
             ans = ask_snapshot()
             if ans is None:
                 return
@@ -3019,40 +3057,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
 
     def vm_readme(T, title, text):
         T["readme_title"].set(title)
-        T["readme_text"] = text
         set_text(T["readme"], text)
-        T["readme_btn"].configure(state=("normal" if text else "disabled"))
-        w = T.get("readme_win")
-        if w is not None and w.winfo_exists():
-            if text:
-                w.title(title)
-                set_text(T["readme_win_text"], text)
-            else:
-                w.destroy()
-
-    def vm_readme_window(T):
-        """The README in its own window: big, resizable, and it can sit beside the student's work."""
-        w = T.get("readme_win")
-        if w is None or not w.winfo_exists():
-            w = tk.Toplevel(root)
-            w.geometry("720x600")
-            root.update_idletasks()
-            m = re.match(r"(\d+)x(\d+)[+-](-?\d+)[+-](-?\d+)", root.geometry())
-            if m and int(m[1]) > 200 and int(m[2]) > 200:   # beside the main window (once it's shown) if it fits
-                rw, rh, rx, ry = (int(v) for v in m.groups())
-                room = root.winfo_screenwidth() - (rx + rw + 12) - 8
-                if room >= 420:
-                    w.geometry(f"{min(720, room)}x{rh}+{rx + rw + 12}+{ry}")
-            w.minsize(320, 200)
-            txt = scrolledtext.ScrolledText(w, wrap="word", state="disabled", font=("TkDefaultFont", 12),
-                                            padx=16, pady=12, relief="flat")
-            ttk.Button(w, text="Close", command=w.destroy).pack(side="bottom", anchor="e", padx=10, pady=8)
-            txt.pack(fill="both", expand=True)
-            T["readme_win"], T["readme_win_text"] = w, txt
-        w.title(T["readme_title"].get())
-        set_text(T["readme_win_text"], T["readme_text"])
-        w.deiconify()
-        w.lift()
 
     def vm_results(T, payload):
         items = payload.get("items", [])
@@ -3114,10 +3119,8 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_set_state(T, payload)
         elif sub == "cards":
             vm_cards(T, payload)
-        elif sub == "readme":   # the practice just started: show its README in the big window too
+        elif sub == "readme":
             vm_readme(T, "README: " + payload.get("title", ""), payload.get("text", ""))
-            if T["readme_text"]:
-                vm_readme_window(T)
         elif sub == "results":
             vm_results(T, payload)
         elif sub == "change":
