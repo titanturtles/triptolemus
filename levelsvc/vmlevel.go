@@ -84,3 +84,28 @@ func agentKinds(q string) map[string]bool {
 	}
 	return out
 }
+
+// vulnDef is one scored item of a VM scenario, for the scoreboard's admin per-vuln view.
+type vulnDef struct {
+	Message string `json:"message"`
+	Points  int    `json:"points"`
+}
+
+// scenarioVulns lists a scenario's scored items (message + points) in order. A negative-point
+// item is a penalty.
+func scenarioVulns(data []byte) []vulnDef {
+	var s struct {
+		Checks []struct {
+			Message string `json:"message"`
+			Points  int    `json:"points"`
+		} `json:"checks"`
+	}
+	if json.Unmarshal(data, &s) != nil {
+		return nil
+	}
+	out := make([]vulnDef, 0, len(s.Checks))
+	for _, c := range s.Checks {
+		out = append(out, vulnDef{Message: c.Message, Points: c.Points})
+	}
+	return out
+}

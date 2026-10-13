@@ -1789,6 +1789,40 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminClassToken returns the shared student class token (generating one if needed).
+// adminVulns returns each level's scored items (message + points) for a competition, so the
+// scoreboard can show which practice vulns a team has and hasn't fixed. VM practices list the
+// scenario's checks; Cisco levels have no server-side item list (empty).
+func adminVulns(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if !admin(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	c := snapshot()
+	cp := resolveComp(c, r.URL.Query().Get("comp"))
+	if cp == nil {
+		http.Error(w, "no such competition", 404)
+		return
+	}
+	type levelVulns struct {
+		Level int       `json:"level"`
+		Name  string    `json:"name"`
+		Image string    `json:"image"`
+		Vulns []vulnDef `json:"vulns"`
+	}
+	levels := []levelVulns{}
+	for _, l := range cp.Levels {
+		vulns := []vulnDef{}
+		if cp.Kind != "" { // a VM scenario lists its checks; a .pka does not
+			if data, err := os.ReadFile(filepath.Join(c.FilesDir, cp.ID, l.File)); err == nil {
+				vulns = scenarioVulns(data)
+			}
+		}
+		levels = append(levels, levelVulns{Level: l.Level, Name: l.Name, Image: l.Image, Vulns: vulns})
+	}
+	writeJSON(w, map[string]interface{}{"comp": cp.ID, "kind": kindName(cp.Kind), "levels": levels})
+}
+
 func adminClassToken(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	if !admin(r) {
@@ -1887,6 +1921,7 @@ func main() {
 	http.HandleFunc("/agent/file", agentFile)
 	http.HandleFunc("/admin/agentpublish", adminAgentPublish)
 	http.HandleFunc("/admin/competitions", adminCompetitions)
+	http.HandleFunc("/admin/vulns", adminVulns)
 	http.HandleFunc("/admin/classtoken", adminClassToken)
 	http.HandleFunc("/admin/deploy", adminDeploy)
 	http.HandleFunc("/admin/create", adminCreate)

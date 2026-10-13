@@ -139,6 +139,26 @@ func TestScenarioCompetitions(t *testing.T) {
 		t.Fatalf("admin competitions kinds = %v", kinds)
 	}
 
+	// /admin/vulns lists each scenario's scored items (for the scoreboard's per-vuln view)
+	reqv := httptest.NewRequest("GET", "/admin/vulns?comp=linux-basics-1", nil)
+	reqv.Header.Set("X-Admin-Token", "a")
+	wv := httptest.NewRecorder()
+	adminVulns(wv, reqv)
+	var vout struct {
+		Kind   string
+		Levels []struct {
+			Vulns []struct {
+				Message string
+				Points  int
+			}
+		}
+	}
+	json.Unmarshal(wv.Body.Bytes(), &vout)
+	if wv.Code != 200 || vout.Kind != "linux" || len(vout.Levels) != 1 || len(vout.Levels[0].Vulns) != 1 ||
+		vout.Levels[0].Vulns[0].Points != 20 {
+		t.Fatalf("admin vulns = %d %s", wv.Code, wv.Body.String())
+	}
+
 	// the level download keeps the scenario's extension (a practice level is always unlocked;
 	// the unreachable database just reads as no score)
 	scores = unreachableScores(t)
