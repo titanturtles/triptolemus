@@ -1060,10 +1060,13 @@ def write_marker(info):
 def run_script(script, timeout=60):
     """Run a scenario script: PowerShell on Windows, bash (or sh) elsewhere.
     Returns (exit code, stdout, stderr)."""
-    tmp = None
+    tmp, env = None, None
     if sys.platform.startswith("win"):
         script = "$ProgressPreference = 'SilentlyContinue'\n" + script
         argv = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+        # Started from a PowerShell 7 session, Windows PowerShell inherits PS7's module path and then
+        # can't load its own modules (ConvertTo-SecureString etc.); without it, it uses the system one.
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
         if len(script) < 8000:
             argv += ["-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
         else:  # past the command-line limit: run it from a file
@@ -1074,14 +1077,24 @@ def run_script(script, timeout=60):
     else:
         argv = [shutil.which("bash") or "/bin/sh", "-c", script]
     try:
-        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, **NO_WINDOW)
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=env, **NO_WINDOW)
     finally:
         if tmp:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+    return r.returncode, r.stdout.decode("utf-8", "replace"), _ps_errors(r.stderr.decode("utf-8", "replace"))
+
+
+def _ps_errors(text):
+    """PowerShell writes errors to a redirected stderr as CLIXML; turn that back into the plain
+    message text (anything else passes through)."""
+    if "<Objs" not in text:
+        return text
+    import html
+    parts = re.findall(r'<S S="Error">(.*?)</S>', text, re.S)
+    return "".join(html.unescape(p).replace("_x000D__x000A_", "\n") for p in parts).strip() or text
 
 
 def _ps(s):
