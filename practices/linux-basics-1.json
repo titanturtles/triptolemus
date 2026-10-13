@@ -2,7 +2,7 @@
   "format": 1,
   "os": "linux",
   "title": "Linux Basics 1",
-  "readme": "Linux Basics 1\n\nYou are the administrator of this workstation. A security review found problems. Fix them without breaking what the company needs.\n\nAuthorized administrators:\n  • you (the account you are logged in with)\n\nAuthorized users:\n  • alice\n  • bob\n\nCompany policy:\n  • Only authorized users may have accounts on this computer.\n  • Only authorized administrators may have administrator (sudo) rights.\n  • The host firewall must be turned on.\n  • User passwords must expire after at most 90 days.\n  • Sensitive system files must not be readable by everyone.\n\nDo not delete authorized users. There are 5 problems, 20 points each. Your score updates in PT Comp about every 20 seconds.",
+  "readme": "Linux Basics 1\n\nYou are the administrator of this workstation. A security review found problems. Fix them without breaking what the company needs.\n\nAuthorized administrators:\n  • you (the account you are logged in with)\n\nAuthorized users:\n  • alice\n  • bob\n\nCompany policy:\n  • Only authorized users may have accounts on this computer.\n  • Only authorized administrators may have administrator (sudo) rights.\n  • The host firewall must be turned on.\n  • User passwords must expire after at most 90 days.\n  • Sensitive system files must not be readable by everyone.\n\nThere are 5 problems, 20 points each. Breaking what the company needs is a penalty: deleting an authorized user costs 10 points. Your score updates in PT Comp about every 20 seconds.",
   "setup": "set -e\n# Plants the 5 problems. Every problem is forced into place, so a VM someone already hardened\n# still starts the practice with all 5.\npw() { printf '%s' \"$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)Aa1!\"; }\nfor u in alice bob hacker; do\n    id \"$u\" >/dev/null 2>&1 || useradd -m -s /bin/bash \"$u\"\n    echo \"$u:$(pw)\" | chpasswd\ndone\n# 1) hacker exists (unauthorized). 2) bob is an administrator, but only you should be.\nusermod -aG sudo bob\n# 3) the firewall is off\ncommand -v ufw >/dev/null || { echo \"ufw is not installed on this VM\" >&2; exit 1; }\nufw --force disable >/dev/null\n# 4) passwords never expire\nif grep -qE '^[[:space:]]*PASS_MAX_DAYS' /etc/login.defs; then\n    sed -i -E 's/^[[:space:]]*PASS_MAX_DAYS.*/PASS_MAX_DAYS\\t99999/' /etc/login.defs\nelse\n    printf 'PASS_MAX_DAYS\\t99999\\n' >> /etc/login.defs\nfi\n# 5) everyone can read the password hashes\nchmod 644 /etc/shadow\n",
   "checks": [
     {
@@ -57,6 +57,26 @@
           "type": "PermissionIs",
           "path": "/etc/shadow",
           "value": "???????---"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user alice",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "alice"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user bob",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "bob"
         }
       ]
     }

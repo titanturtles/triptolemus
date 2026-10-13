@@ -6,10 +6,18 @@ runs `setup` as administrator/root to plant the problems, then scores `checks` e
 and posts the score to the scoreboard like a Cisco level. Students start from their VM's
 **Clean** snapshot and restore it to redo a practice or load another one.
 
+The VM can't see its own snapshots, so before the first setup on a VM PT Comp asks whether there is
+a Clean snapshot (*Yes, start* / *Not yet, I'll take it now* / *Cancel*). It saves the answer on the
+VM before the student takes the snapshot, so the snapshot keeps it and a restored VM doesn't ask
+again. PT Comp tells the student to restore Clean when the VM isn't clean: a different practice
+is set up, or a setup failed or was interrupted (the marker is written as `setup` before the
+script runs and becomes `ready` only once it works). The tab shows the VM's state under the
+practice picker.
+
 | File | Problems |
 |---|---|
-| `linux-basics-1.json` | unauthorized user, unauthorized admin (sudo), ufw off, passwords never expire, `/etc/shadow` world-readable |
-| `windows-basics-1.json` | unauthorized user, unauthorized admin, Guest enabled, firewall off, minimum password length 0 |
+| `linux-basics-1.json` | unauthorized user, unauthorized admin (sudo), ufw off, passwords never expire, `/etc/shadow` world-readable; penalty for deleting alice or bob |
+| `windows-basics-1.json` | unauthorized user, unauthorized admin, Guest enabled, firewall off, minimum password length 0; penalty for deleting alice or bob |
 
 ## Format
 
@@ -22,7 +30,9 @@ and posts the score to the scoreboard like a Cisco level. Students start from th
   "setup": "bash (PowerShell on Windows), run once as root/administrator",
   "checks": [
     {"message": "Removed the unauthorized user hacker", "points": 20,
-     "pass": [{"type": "UserExistsNot", "user": "hacker"}]}
+     "pass": [{"type": "UserExistsNot", "user": "hacker"}]},
+    {"message": "Deleted the authorized user alice", "points": -10,
+     "pass": [{"type": "UserExistsNot", "user": "alice"}]}
   ],
   "complete_message": "optional: shown when the level is cleared (e.g. a password)"
 }
@@ -31,6 +41,13 @@ and posts the score to the scoreboard like a Cisco level. Students start from th
 A check scores when every `pass` condition holds and no `fail` condition does. Put `Not` after a
 type to negate it (`UserExistsNot`). A condition that errors (missing file, unknown group) counts
 as false, in the `Not` form too, so a broken check never gives free points.
+
+A check with **negative points is a penalty** (as in aeacus): it costs its points while its
+conditions hold, and goes away when the student undoes the damage. Penalties lower the score but
+don't count as problems (a level clears on the share of problems fixed). PT Comp shows them in red,
+and plays a rising chime when the score goes up and a low one when it drops (a lost fix or a
+penalty); students can turn the sound off with the **Sound** box. Penalties need PT Comp 1.2.1+
+(1.2.0 sends a penalty in a form the scoreboard rejects).
 
 | Type | Fields | Notes |
 |---|---|---|
@@ -54,9 +71,11 @@ as false, in the `Not` form too, so a broken check never gives free points.
   scores right after setup.
 - **No internet in setup if you can avoid it** (no `apt install`): students' VMs may be offline.
 - Each problem's check should accept every reasonable fix (e.g. `/etc/shadow` 640 *or* 600).
-- Add a fix script in `tests/` (`<name>.fix.sh` / `<name>.fix.ps1`). The **Test practices**
-  GitHub Action runs setup → nothing scores, fixes → everything scores, setup again → nothing
-  scores, on real Ubuntu 22.04 and Windows Server runners. Fix scripts are never uploaded.
+- Add a fix script in `tests/` (`<name>.fix.sh` / `<name>.fix.ps1`), and a penalty script
+  (`<name>.penalty.sh` / `.ps1`) that sets off every penalty. The **Test practices** GitHub Action
+  runs setup → nothing counts, fixes → every problem scores and no penalty, penalties → every
+  penalty fires, setup again → nothing counts, on real Ubuntu 22.04 and Windows Server runners.
+  Test scripts are never uploaded.
 
 ## Publishing
 

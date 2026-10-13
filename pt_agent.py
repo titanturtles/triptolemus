@@ -28,7 +28,8 @@ Students only ever enter their Team ID; everything else lives in this config.
 Packet Tracer setup (once per machine): Extensions > IPC > Configure Apps > Add
 the ptagent.pta file, then quit PT normally so it saves. Launch PT before Start.
 """
-import argparse, base64, hashlib, json, os, platform, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, threading, time, uuid
+import argparse, atexit, base64, hashlib, io, json, math, os, platform, re, shlex, shutil, socket, stat, struct, subprocess, sys
+import tempfile, threading, time, uuid, wave
 import urllib.parse, urllib.request, urllib.error
 
 try:
@@ -41,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.0"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.1"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -89,7 +90,8 @@ def build_update(password, team, image, percent, items_done, items_total, items=
         entries = [("Completion", score)]
     blob = str(scored_count).encode() + DELIM + str(total_count).encode() + DELIM
     for name, pts in entries:
-        blob += f"{name} - {pts} pts".encode("utf-8", "replace") + DELIM
+        shown = f"N{-pts}" if pts < 0 else str(pts)  # a penalty is "N<points>", as aeacus sends it
+        blob += f"{name} - {shown} pts".encode("utf-8", "replace") + DELIM
     vhex = _encrypt(password, blob).encode("ascii")
     upd = (b"team" + DELIM + team.encode() + DELIM + b"image" + DELIM + image.encode() + DELIM +
            b"score" + DELIM + str(score).encode() + DELIM + b"vulns" + DELIM + vhex + DELIM +
@@ -441,6 +443,20 @@ class LevelsClient:
 NO_WINDOW = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
 
 
+def system_env():
+    """The environment for starting a system program. A Linux build points LD_LIBRARY_PATH at its
+    own bundled libraries (keeping the original in LD_LIBRARY_PATH_ORIG); a system tool started
+    with that can load the wrong versions of its libraries."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is None:
+            env.pop("LD_LIBRARY_PATH", None)
+        else:
+            env["LD_LIBRARY_PATH"] = orig
+    return env
+
+
 def close_pt():
     """Terminate the Packet Tracer process (best-effort, cross-platform)."""
     try:
@@ -562,8 +578,10 @@ def load_state(base_dir):
 
 
 def save_state(base_dir, state):
+    """Update the saved settings (keys not given keep their saved values)."""
     try:
         path = os.path.join(base_dir, STATE_FILE)
+        state = dict(load_state(base_dir), **state)
         with open(path, "w") as f:
             json.dump(state, f)
         _give_back(path)
@@ -997,16 +1015,37 @@ class Competition:
 #    "setup": script that plants the problems (PowerShell on Windows, bash elsewhere),
 #    "checks": [{"message": ..., "points": N, "pass": [condition, ...], "fail": [condition, ...]}],
 #    "complete_message": optional text shown once the level is cleared}
-# A check is earned when every "pass" condition holds and no "fail" condition does. Condition
+# A check is earned when every "pass" condition holds and no "fail" condition does. A check with
+# negative points is a penalty (aeacus style): it costs its points while its conditions hold. Condition
 # types follow aeacus (Command, CommandContains, CommandOutput, FileContains, PathExists,
 # UserExists, UserInGroup, FirewallUp, ServiceUp, PermissionIs, SecurityPolicy), each also with a
 # "Not" form, and a condition that errors counts as false even in its "Not" form, as in aeacus.
 # Setup and checks change and read system settings, so the agent runs as administrator/root.
 # Students set a practice up on a VM restored to its Clean snapshot; a marker file records which
-# level is set up, so a different one only loads after another restore.
+# level is set up (state "setup" while the setup script runs, "ready" once it worked), so a
+# different one, or a retry after a setup that didn't finish, only loads after another restore.
+# The VM can't see its snapshots, so PT Comp asks the student once and remembers the answer in a
+# note written before the snapshot is taken (the snapshot then carries it).
 VM_OS_FOR_KIND = {"windows": ("windows",), "linux": ("linux", "freebsd")}
 VM_INTERVAL = 20  # seconds between scoring runs (a Windows check starts PowerShell)
 VM_MARKER = "practice.json"
+VM_SNAPSHOT_NOTE = "snapshot.json"
+TAKE_SNAPSHOT = ("In the VM's window, click Machine → Take Snapshot… and name it Clean. "
+                 "(VMware: VM → Snapshot → Take Snapshot.)")
+RESTORE_SNAPSHOT = ("Shut the VM down. In VirtualBox Manager, select the VM, open its Snapshots, pick Clean and "
+                    "click Restore, then start the VM again. (Shortcut when Clean is your latest snapshot: close "
+                    "the VM's window, choose “Power off the machine” and tick “Restore current snapshot”. "
+                    "VMware: VM → Snapshot → Revert to Snapshot.)")
+
+
+def vm_tally(items):
+    """A scoring run's totals -> (problems fixed, problems, points, possible points, penalties).
+    Penalties (negative points) count against the points but aren't problems to fix."""
+    vulns = [i for i in items if i["points"] >= 0]
+    done = sum(1 for i in vulns if i["earned"])
+    pts = sum(i["points"] for i in items if i["earned"])
+    pens = sum(1 for i in items if i["points"] < 0 and i["earned"])
+    return done, len(vulns), pts, sum(i["points"] for i in vulns), pens
 
 
 class PracticeError(Exception):
@@ -1057,6 +1096,25 @@ def write_marker(info):
         json.dump(info, f)
 
 
+def marker_unfinished(mark):
+    """A practice's setup started on this VM but didn't finish: the VM is partly changed.
+    (Markers from 1.2.0 have no state; they were only written after a setup worked.)"""
+    return bool(mark) and mark.get("state") == "setup"
+
+
+def snapshot_noted():
+    return os.path.exists(os.path.join(vm_state_dir(), VM_SNAPSHOT_NOTE))
+
+
+def note_snapshot():
+    """Remember that the student has a Clean snapshot of this VM, or is about to take one. Written
+    before they take it, the snapshot carries the note, so a restored VM doesn't ask again."""
+    d = vm_state_dir()
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, VM_SNAPSHOT_NOTE), "w") as f:
+        json.dump({"at": int(time.time())}, f)
+
+
 def run_script(script, timeout=60):
     """Run a scenario script: PowerShell on Windows, bash (or sh) elsewhere.
     Returns (exit code, stdout, stderr)."""
@@ -1076,6 +1134,7 @@ def run_script(script, timeout=60):
             argv += ["-File", tmp]
     else:
         argv = [shutil.which("bash") or "/bin/sh", "-c", script]
+        env = system_env()
     try:
         r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=env, **NO_WINDOW)
     finally:
@@ -1283,6 +1342,7 @@ class VMPractice:
     VM_INTERVAL seconds and posts the score like a Cisco level. report(kind, payload) kinds:
     'log', 'status', 'error', 'state' ('idle' / 'running'), 'cards' (server level status),
     'readme' ({'title', 'text'}), 'results' (the checks after a scoring run),
+    'change' ({'gained', 'lost'}: checks that changed since the last run),
     'cleared' ({'level', 'text', 'next', 'popup'})."""
     def __init__(self, cfg, team_id, report, cancel):
         self.cfg, self.team, self.report, self.cancel = cfg, team_id, report, cancel
@@ -1295,6 +1355,7 @@ class VMPractice:
         self.loop_thread = None
         self.cleared_noted = set()
         self.primed = False   # first status seen; later clears are new (popup)
+        self.last_earned = None  # each check's state in the last scoring run
 
     def level_cfg(self, n):
         return next((l for l in self.cfg["levels"] if int(l["level"]) == int(n)), None)
@@ -1316,17 +1377,23 @@ class VMPractice:
             title = f"{self.name}: {lc.get('name') or f'Level {lvl}'}"
             here = {"comp": self.comp, "level": lvl, "image": lc["image"]}
             mark = read_marker()
+            if marker_unfinished(mark):
+                raise PracticeError(
+                    f"Setting up “{mark.get('title') or mark.get('comp')}” didn't finish, so this VM is only "
+                    "partly changed. Restore your Clean snapshot before starting a practice.\n\n"
+                    f"How: {RESTORE_SNAPSHOT}\n\nThen open PT Comp and click Start again.")
             if mark and all(mark.get(k) == v for k, v in here.items()):
                 self.report("log", f"{title} is already set up on this VM. Resuming scoring.")
             elif mark:
                 raise PracticeError(
-                    f"This VM already has “{mark.get('title') or mark.get('comp')}” set up.\n\n"
-                    "To load a different practice or level, restore your VM's Clean snapshot "
-                    "(VirtualBox: Snapshots → Clean → Restore), start the VM, then open PT Comp "
-                    "and click Start again.")
+                    f"This VM already has “{mark.get('title') or mark.get('comp')}” set up. To load a "
+                    "different practice or level, restore your Clean snapshot first.\n\n"
+                    f"How: {RESTORE_SNAPSHOT}\n\nThen open PT Comp and click Start again.")
             else:
+                info = dict(here, title=title, team=self.team, at=int(time.time()))
+                write_marker(dict(info, state="setup"))  # from here on the VM isn't clean, even if setup fails
                 self._setup(scen, title)
-                write_marker(dict(here, title=title, team=self.team, at=int(time.time())))
+                write_marker(dict(info, state="ready"))
             self.current, self.scenario = lvl, scen
             self.report("readme", {"title": title, "text": scen.get("readme", "")})
         except PracticeError as e:
@@ -1358,12 +1425,15 @@ class VMPractice:
         code, out, err = run_script(scen.get("setup", ""), timeout=900)
         if code != 0:
             raise PracticeError(f"The practice setup failed (exit code {code}).\n\n{(err or out).strip()[-600:]}\n\n"
-                                "Restore your Clean snapshot and try again. Tell your instructor if it keeps failing.")
+                                "Restore your Clean snapshot and try again. Tell your instructor if it keeps "
+                                f"failing.\n\nHow to restore: {RESTORE_SNAPSHOT}")
         # setup puts every problem in place, so nothing may count as fixed yet
-        done = [r["name"] for r in ScenarioChecks().score(scen.get("checks", [])) if r["earned"]]
+        done = [r["name"] + (" (penalty)" if r["points"] < 0 else "")
+                for r in ScenarioChecks().score(scen.get("checks", [])) if r["earned"]]
         if done:
-            raise PracticeError("The practice didn't start cleanly. These already count as fixed:\n\n• "
-                                + "\n• ".join(done) + "\n\nRestore your Clean snapshot and click Start again.")
+            raise PracticeError("The practice didn't start cleanly. These already count:\n\n• "
+                                + "\n• ".join(done) + "\n\nRestore your Clean snapshot and click Start again."
+                                f"\n\nHow to restore: {RESTORE_SNAPSHOT}")
         self.report("log", "Setup done. Every problem is in place. Go!")
 
     def _loop(self):
@@ -1376,15 +1446,15 @@ class VMPractice:
                 self.report("log", f"Scoring error: {e}")
                 items = None
             if items is not None and not self.loop_stop.is_set():
-                done = sum(1 for i in items if i["earned"])
-                pts = sum(i["points"] for i in items if i["earned"])
-                pct = done * 100.0 / len(items) if items else 0.0
+                done, total, pts, possible, pens = vm_tally(items)
+                pct = done * 100.0 / total if total else 0.0
                 code = post_update(self.cfg["remote"], build_update(lc["password"], self.team, lc["image"],
-                                                                    pct, done, len(items), items))
+                                                                    pct, done, total, items))
                 self.report("results", {"level": self.current, "items": items, "posted": code})
-                self.report("log", f"Level {self.current}: {done}/{len(items)} fixed, "
-                                   f"{pts}/{sum(i['points'] for i in items)} pts -> "
-                                   + ("OK" if code == 200 else f"rejected({code})"))
+                self._note_changes(items)
+                self.report("log", f"Level {self.current}: {done}/{total} fixed, "
+                                   + (f"{pens} penalt{'y' if pens == 1 else 'ies'}, " if pens else "")
+                                   + f"{pts}/{possible} pts -> " + ("OK" if code == 200 else f"rejected({code})"))
             try:
                 levels = self.levels.status(self.team, self.comp).get("levels", [])
                 self.report("cards", {"levels": levels, "active": self.current})
@@ -1392,6 +1462,22 @@ class VMPractice:
             except Exception as e:
                 self.report("log", f"levels service unreachable: {e}")
             self.loop_stop.wait(VM_INTERVAL)
+
+    def _note_changes(self, items):
+        """Report what changed since the last scoring run, so the GUI can play a sound: fixing a
+        problem or undoing a penalty gains points; undoing a fix or causing a penalty loses them.
+        The first run is the baseline (resuming doesn't replay the earlier fixes)."""
+        before, self.last_earned = self.last_earned, [i["earned"] for i in items]
+        if before is None or len(before) != len(items):
+            return
+        gained, lost = [], []
+        for was, it in zip(before, items):
+            delta = (it["points"] if it["earned"] else -it["points"]) if was != it["earned"] else 0
+            if delta:
+                (gained if delta > 0 else lost).append({"name": it["name"], "points": delta,
+                                                        "penalty": it["points"] < 0})
+        if gained or lost:
+            self.report("change", {"gained": gained, "lost": lost})
 
     def _note_cleared(self, levels):
         """Tell the GUI once when the current level is cleared (a popup only for a new clear)."""
@@ -1449,6 +1535,93 @@ def relaunch_elevated(cfg_path, tab):
     except OSError as e:
         return None, f"Could not start PT Comp as root: {e}"
     return p, ""
+
+
+# ---------------- sounds (points gained / lost in a Windows/Linux practice) ----------------
+# Like a CyberPatriot image: a rising chime when the score goes up, a low falling one when it drops.
+# Both are made here (no sound files to ship); spec = [(start s, frequency Hz, length s)], harmonics.
+SOUNDS = {"gain": ([(0.0, 1046.5, 0.45), (0.09, 1568.0, 0.6)], [(1, 1.0), (2, 0.25)]),
+          "loss": ([(0.0, 392.0, 0.3), (0.17, 261.6, 0.55)], [(1, 1.0), (3, 0.35), (5, 0.18)])}
+_sound_dir = None
+
+
+def _chime_wav(notes, harmonics, rate=22050):
+    """WAV bytes for a few overlapping notes, each with a fast attack and an exponential fade."""
+    n = int(max(s + l for s, _f, l in notes) * rate) + 1
+    buf = [0.0] * n
+    for start, freq, length in notes:
+        s0 = int(start * rate)
+        for k in range(int(length * rate)):
+            t = k / rate
+            env = min(1.0, t / 0.004) * math.exp(-5.0 * t / length)
+            buf[s0 + k] += env * sum(a * math.sin(2 * math.pi * freq * h * t) for h, a in harmonics)
+    peak = max(abs(v) for v in buf) or 1.0
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack(f"<{n}h", *(int(v / peak * 0.7 * 32767) for v in buf)))
+    return out.getvalue()
+
+
+def _sound_path(kind):
+    global _sound_dir
+    if _sound_dir is None:
+        d = tempfile.mkdtemp(prefix="ptcomp-sounds-")
+        os.chmod(d, 0o755)  # a root copy plays them as the desktop user (below)
+        for k, (notes, harmonics) in SOUNDS.items():
+            p = os.path.join(d, k + ".wav")
+            with open(p, "wb") as f:
+                f.write(_chime_wav(notes, harmonics))
+            os.chmod(p, 0o644)
+        atexit.register(shutil.rmtree, d, True)
+        _sound_dir = d
+    return os.path.join(_sound_dir, kind + ".wav")
+
+
+def _desktop_user():
+    """For a root copy (pkexec or sudo): Popen arguments that run a program as the student's
+    desktop user. PulseAudio and PipeWire only take connections from the user they belong to."""
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    if not uid or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return {"env": system_env()}
+    import pwd
+    pw = pwd.getpwuid(int(uid))
+    env = {"PATH": os.environ.get("PATH") or "/usr/bin:/bin", "HOME": pw.pw_dir, "USER": pw.pw_name,
+           "LOGNAME": pw.pw_name, "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}"}
+    return {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": os.getgrouplist(pw.pw_name, pw.pw_gid),
+            "env": env}
+
+
+def play_sound(kind):
+    """Play the 'gain' or 'loss' chime without waiting. False when there's no way to play it (the
+    caller rings the window bell instead)."""
+    try:
+        path = _sound_path(kind)
+        if sys.platform.startswith("win"):
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            return True
+        players = ([["afplay", path]] if sys.platform == "darwin"
+                   else [["paplay", path], ["pw-play", path], ["aplay", "-q", path]])
+        players = [p for p in players if shutil.which(p[0])]
+        if not players:
+            return False
+        kw = _desktop_user()
+
+        def run():  # the first player that works (paplay fails without a sound server, and so on)
+            for argv in players:
+                try:
+                    if subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=10, **kw).returncode == 0:
+                        return
+                except Exception:
+                    pass
+        threading.Thread(target=run, daemon=True).start()
+        return True
+    except Exception:
+        return False
 
 
 # ---------------- enrollment (competition set from the server) ----------------
@@ -2617,6 +2790,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
 
     # ---- Windows / Linux tabs: practices that run inside the student's practice VM ----
     here_os, admin_now = host_os(), is_admin()
+    sound_var = tk.BooleanVar(value=state.get("sound", True))
 
     def set_text(widget, text):
         widget.configure(state="normal")
@@ -2632,10 +2806,11 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["can_start"] = T["here"] and admin_now
         adm = "administrator" if kind == "windows" else "root"
         ttk.Label(f, wraplength=640, justify="left", foreground="#2f5e97", text=(
-            f"How to use:   1) Run PT Comp inside your {os_label} practice VM, as {adm}.   2) Pick a "
-            "practice and click Start: PT Comp sets the problems up and shows the README.   3) Fix the "
-            f"problems; your score updates every {VM_INTERVAL} seconds.   4) To redo a practice or load "
-            "another one, restore the VM's Clean snapshot first.")).pack(anchor="w", fill="x")
+            f"How to use:   1) Run PT Comp inside your {os_label} practice VM, as {adm}.   2) Before your "
+            "first practice, take a snapshot of the VM named Clean.   3) Pick a practice and click Start, "
+            f"then fix the problems in the README; your score updates every {VM_INTERVAL} seconds.   "
+            "4) To redo a practice or load another one, restore the Clean snapshot first.")).pack(
+            anchor="w", fill="x")
         if not T["here"]:
             ttk.Label(f, foreground="#a15c00", wraplength=640, justify="left", text=(
                 f"This computer isn't running {os_label}. Open this tab in PT Comp inside your {os_label} "
@@ -2658,18 +2833,30 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["start"].pack(side="left", padx=(6, 3))
         T["stop"] = ttk.Button(bar, text="Stop", command=lambda: vm_stop(T))
         T["stop"].pack(side="left")
+        ttk.Checkbutton(bar, text="Sound", variable=sound_var,
+                        command=lambda: save_state(conf_dir, {"sound": sound_var.get()})).pack(side="right")
         T["levels_var"] = tk.StringVar(value="")
-        ttk.Label(f, textvariable=T["levels_var"], foreground="#555", wraplength=640).pack(anchor="w", pady=(2, 0))
-        T["readme_title"] = tk.StringVar(value="README (shown once you Start)")
-        ttk.Label(f, textvariable=T["readme_title"], font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(6, 0))
-        T["readme"] = scrolledtext.ScrolledText(f, height=7, wrap="word", state="disabled", font=("TkDefaultFont", 9))
-        T["readme"].pack(fill="x")
+        T["levels_label"] = ttk.Label(f, textvariable=T["levels_var"], foreground="#555", wraplength=640)
+        T["levels_label"].pack(anchor="w", pady=(2, 0))
+        T["note"] = tk.Label(f, justify="left", anchor="w", wraplength=630, padx=8, pady=5)  # packed by vm_note
+        # packed bottom-up so the README (last) takes whatever height is left, and grows with the window
+        T["fixed"] = scrolledtext.ScrolledText(f, height=4, wrap="word", state="disabled", font=("TkDefaultFont", 9),
+                                               background="#f4faf5", relief="flat", padx=6, pady=4)
+        T["fixed"].tag_configure("penalty", foreground="#b3261e")
+        T["fixed"].pack(side="bottom", fill="x")
         T["score_var"] = tk.StringVar(value="")
         ttk.Label(f, textvariable=T["score_var"], font=("TkDefaultFont", 10, "bold"),
-                  foreground="#1b7f3b").pack(anchor="w", pady=(6, 0))
-        T["fixed"] = tk.Text(f, height=4, wrap="word", state="disabled", font=("TkDefaultFont", 9),
-                             background="#f4faf5", relief="flat", padx=6, pady=4)
-        T["fixed"].pack(fill="x")
+                  foreground="#1b7f3b").pack(side="bottom", anchor="w", pady=(6, 0))
+        head = ttk.Frame(f)
+        head.pack(fill="x", pady=(6, 0))
+        T["readme_title"] = tk.StringVar(value="README (shown once you Start)")
+        ttk.Label(head, textvariable=T["readme_title"], font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        T["readme_btn"] = ttk.Button(head, text="Open in a big window", state="disabled",
+                                     command=lambda: vm_readme_window(T))
+        T["readme_btn"].pack(side="right")
+        T["readme_text"] = ""
+        T["readme"] = scrolledtext.ScrolledText(f, height=3, wrap="word", state="disabled", font=("TkDefaultFont", 10))
+        T["readme"].pack(fill="both", expand=True)
         T["combo"].bind("<<ComboboxSelected>>", lambda *_: vm_select(T))
         VM[kind] = T
         vm_set_state(T, "idle")
@@ -2682,6 +2869,68 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["stop"].configure(state=("normal" if st == "running" else "disabled"))
         T["combo"].configure(state=("readonly" if idle else "disabled"))
         topbar_buttons()
+        vm_note(T)
+
+    def ask_choice(title, heading, text, buttons):
+        """A small modal dialog over the main window -> the key of the button clicked (None when it's
+        closed). buttons = [(key, label), ...]."""
+        win = tk.Toplevel(root)
+        win.title(title)
+        win.transient(root)
+        win.resizable(False, False)
+        out = {"v": None}
+        ttk.Label(win, text=heading, font=("TkDefaultFont", 11, "bold"), padding=(16, 14, 16, 6)).pack(anchor="w")
+        ttk.Label(win, text=text, wraplength=500, justify="left", padding=(16, 0, 16, 12)).pack(anchor="w")
+        bb = ttk.Frame(win, padding=(12, 0, 12, 14))
+        bb.pack(fill="x")
+        for key, label in buttons:
+            ttk.Button(bb, text=label, command=lambda k=key: (out.update(v=k), win.destroy())).pack(side="left", padx=4)
+        win.update_idletasks()
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - win.winfo_reqwidth()) // 2)
+        win.geometry(f"+{max(0, x)}+{max(0, root.winfo_rooty() + 100)}")
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        win.wait_window()
+        return out["v"]
+
+    def ask_snapshot():
+        return ask_choice("Clean snapshot", "Take a snapshot before your first practice", (
+            "Starting a practice changes this VM's settings. A snapshot named Clean lets you put the VM "
+            "back the way it is now, to redo a practice or load a different one.\n\n"
+            f"How: {TAKE_SNAPSHOT}\n\nDo you already have a Clean snapshot of this VM?"),
+            [("yes", "Yes, start the practice"), ("later", "Not yet, I'll take it now"), (None, "Cancel")])
+
+    def vm_note(T):
+        """Under the practice picker: a reminder to take the Clean snapshot before the first practice,
+        or to restore it when this VM isn't clean for the practice picked."""
+        text, warn = "", False
+        if T["here"] and T["state"] == "idle":
+            mark = read_marker()
+            picked = (T["by_name"].get(T["var"].get()) or {}).get("comp")
+            there = (mark.get("title") or mark.get("comp")) if mark else ""
+            if marker_unfinished(mark):
+                text, warn = (f"Setting up “{there}” didn't finish on this VM. Restore your Clean snapshot "
+                              "before starting a practice."), True
+            elif mark and picked and mark.get("comp") != picked:
+                text, warn = (f"This VM has “{there}” set up. To start a different practice, restore your "
+                              "Clean snapshot first."), True
+            elif mark:
+                text = (f"“{there}” is set up on this VM: click Start to keep working on it. To redo it from "
+                        "the beginning, restore your Clean snapshot.")
+            elif not snapshot_noted():
+                text = ("First practice on this VM? Take a snapshot named Clean before you click Start "
+                        "(in the VM's window: Machine → Take Snapshot…).")
+        note = T["note"]
+        if text:
+            note.configure(text=text, background=("#fde7e4" if warn else "#e8f1fb"),
+                           foreground=("#8a1c12" if warn else "#1d4f86"))
+            if not note.winfo_manager():
+                note.pack(fill="x", pady=(4, 0), after=T["levels_label"])
+        else:
+            note.pack_forget()
 
     def vm_levels(T):
         c = T["by_name"].get(T["var"].get())
@@ -2691,10 +2940,10 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         for T in Ts:
             names = vm_levels(T)
             T["levels_var"].set("   ·   ".join(names[n] for n in sorted(names)))
-            T["readme_title"].set("README (shown once you Start)")
-            set_text(T["readme"], "")
+            vm_readme(T, "README (shown once you Start)", "")
             T["score_var"].set("")
             set_text(T["fixed"], "")
+            vm_note(T)
 
     def vm_fill(T, comps):
         """Fill a VM tab's practice list; the practice set up on this VM is picked first."""
@@ -2730,6 +2979,20 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             status_var.set("Pick a practice first (click Reload if the list is empty).")
             return
         save_state(conf_dir, {"team_id": team_id})
+        if T["here"] and not read_marker() and not snapshot_noted():   # about to change a clean VM
+            ans = ask_snapshot()
+            if ans is None:
+                return
+            try:
+                note_snapshot()  # now, so a snapshot taken next remembers the answer after a restore
+            except OSError as e:
+                logln(f"Couldn't save the snapshot answer: {e}")
+            if ans == "later":
+                vm_note(T)
+                status_var.set("Take the Clean snapshot now (in the VM's window: Machine → Take Snapshot…), "
+                               "then click Start.")
+                logln("Take the Clean snapshot now, then click Start.")
+                return
         kind = T["kind"]
         T["obj"] = VMPractice(comp_cfg(ENR["shared"], c), team_id, lambda k, p: msgq.put((f"vm:{kind}:{k}", p)),
                               cancel)
@@ -2754,14 +3017,69 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             parts.append(f"{names.get(n, f'Level {n}')}: {mark}")
         T["levels_var"].set("   ·   ".join(parts))
 
+    def vm_readme(T, title, text):
+        T["readme_title"].set(title)
+        T["readme_text"] = text
+        set_text(T["readme"], text)
+        T["readme_btn"].configure(state=("normal" if text else "disabled"))
+        w = T.get("readme_win")
+        if w is not None and w.winfo_exists():
+            if text:
+                w.title(title)
+                set_text(T["readme_win_text"], text)
+            else:
+                w.destroy()
+
+    def vm_readme_window(T):
+        """The README in its own window: big, resizable, and it can sit beside the student's work."""
+        w = T.get("readme_win")
+        if w is None or not w.winfo_exists():
+            w = tk.Toplevel(root)
+            w.geometry("720x600")
+            root.update_idletasks()
+            m = re.match(r"(\d+)x(\d+)[+-](-?\d+)[+-](-?\d+)", root.geometry())
+            if m and int(m[1]) > 200 and int(m[2]) > 200:   # beside the main window (once it's shown) if it fits
+                rw, rh, rx, ry = (int(v) for v in m.groups())
+                room = root.winfo_screenwidth() - (rx + rw + 12) - 8
+                if room >= 420:
+                    w.geometry(f"{min(720, room)}x{rh}+{rx + rw + 12}+{ry}")
+            w.minsize(320, 200)
+            txt = scrolledtext.ScrolledText(w, wrap="word", state="disabled", font=("TkDefaultFont", 12),
+                                            padx=16, pady=12, relief="flat")
+            ttk.Button(w, text="Close", command=w.destroy).pack(side="bottom", anchor="e", padx=10, pady=8)
+            txt.pack(fill="both", expand=True)
+            T["readme_win"], T["readme_win_text"] = w, txt
+        w.title(T["readme_title"].get())
+        set_text(T["readme_win_text"], T["readme_text"])
+        w.deiconify()
+        w.lift()
+
     def vm_results(T, payload):
         items = payload.get("items", [])
-        got = [i for i in items if i.get("earned")]
-        pts, tot = sum(i["points"] for i in got), sum(i["points"] for i in items)
-        T["score_var"].set(f"Score: {pts} / {tot} points: {len(got)} of {len(items)} problems fixed"
+        done, total, pts, possible, pens = vm_tally(items)
+        T["score_var"].set(f"Score: {pts} / {possible} points: {done} of {total} problems fixed"
+                           + (f", {pens} penalt{'y' if pens == 1 else 'ies'}" if pens else "")
                            + ("" if payload.get("posted") == 200 else "   (not saved on the scoreboard; retrying)"))
-        set_text(T["fixed"], "\n".join(f"✓ {i['name']}  (+{i['points']})" for i in got)
-                 or "Nothing fixed yet. Read the README, then start fixing!")
+        lines = ([(f"✗ Penalty: {i['name']}  ({i['points']})", "penalty")
+                  for i in items if i.get("earned") and i["points"] < 0]
+                 + [(f"✓ {i['name']}  (+{i['points']})", "") for i in items if i.get("earned") and i["points"] >= 0])
+        box = T["fixed"]
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        for n, (line, tag) in enumerate(lines):
+            box.insert("end", ("\n" if n else "") + line, tag)
+        if not lines:
+            box.insert("end", "Nothing fixed yet. Read the README, then start fixing!")
+        box.configure(state="disabled")
+
+    def vm_change(T, payload):
+        """Points gained or lost since the last scoring run: log it and play the matching sound."""
+        for g in payload.get("gained", []):
+            logln(f"+{g['points']}  " + ("Penalty removed: " if g.get("penalty") else "") + g["name"])
+        for l in payload.get("lost", []):
+            logln(f"{l['points']}  " + ("Penalty: " if l.get("penalty") else "No longer fixed: ") + l["name"])
+        if sound_var.get() and not play_sound("loss" if payload.get("lost") else "gain"):
+            root.bell()
 
     def vm_cleared(T, payload):
         n, nxt = payload.get("level"), payload.get("next")
@@ -2771,7 +3089,9 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         status_var.set(f"{name} cleared! " + how)
         logln(f"{name} cleared!" + (f" Message: {payload['text']}" if payload.get("text") else ""))
         if payload.get("popup"):
-            msg = f"{name} cleared!\n\n" + (payload["text"] + "\n\n" if payload.get("text") else "") + how
+            msg = (f"{name} cleared!\n\n" + (payload["text"] + "\n\n" if payload.get("text") else "") + how
+                   + ("" if nxt else " To redo it or load another practice, restore your Clean snapshot first.")
+                   + f"\n\nHow to restore: {RESTORE_SNAPSHOT}")
             try:
                 messagebox.showinfo("Practice cleared", msg)
             except Exception:
@@ -2794,11 +3114,14 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_set_state(T, payload)
         elif sub == "cards":
             vm_cards(T, payload)
-        elif sub == "readme":
-            T["readme_title"].set("README: " + payload.get("title", ""))
-            set_text(T["readme"], payload.get("text", ""))
+        elif sub == "readme":   # the practice just started: show its README in the big window too
+            vm_readme(T, "README: " + payload.get("title", ""), payload.get("text", ""))
+            if T["readme_text"]:
+                vm_readme_window(T)
         elif sub == "results":
             vm_results(T, payload)
+        elif sub == "change":
+            vm_change(T, payload)
         elif sub == "cleared":
             vm_cleared(T, payload)
 
@@ -2830,6 +3153,15 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
 
     vm_tab("windows", "Windows 11 / Server", "Windows")
     vm_tab("linux", "Linux / FreeBSD", "Linux")
+
+    def on_tab(_e=None):
+        # a Windows/Linux tab takes the window's spare height (its README grows with the window);
+        # on the Cisco tab the log gets it, as before
+        vm = nb.select() != str(cisco_tab)
+        nb.pack_configure(fill=("both" if vm else "x"), expand=vm)
+        bottom.pack_configure(expand=not vm)
+        log.configure(height=(5 if vm else 7))
+    nb.bind("<<NotebookTabChanged>>", on_tab)
 
     def select_comp(*_):
         comp["obj"] = None   # a different competition needs a fresh Competition object
@@ -2980,13 +3312,23 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         if os.environ.get("PT_AGENT_SELFTEST_TAB") in VM:   # a VM tab mid-practice, for screenshots
             T = VM[os.environ["PT_AGENT_SELFTEST_TAB"]]
             nb.select(T["frame"])
-            vm_message(T["kind"], "readme", {"title": "Linux Basics 1: Users, firewall, files",
-                                              "text": "Authorized administrators: you.\nAuthorized users: alice, bob."})
+            readme = os.environ.get("PT_AGENT_SELFTEST_README")
+            root.after(800, lambda: vm_message(T["kind"], "readme", {   # arrives after Start, like a real one
+                "title": "Linux Basics 1: Users, firewall, files", "text": (
+                    open(readme, encoding="utf-8").read() if readme
+                    else "Authorized administrators: you.\nAuthorized users: alice, bob.")}))
             vm_message(T["kind"], "cards", {"levels": [{"level": 1, "unlocked": True}], "active": 1})
+            if os.environ.get("PT_AGENT_SELFTEST_SNAPSHOT"):   # the Start-time snapshot question
+                root.after(1000, lambda: print("[snapshot] answer:", ask_snapshot()))
+            if os.environ.get("PT_AGENT_SELFTEST_CHANGE"):   # a scoring run that gained and lost points
+                root.after(1000, lambda: vm_message(T["kind"], "change", {
+                    "gained": [{"name": "Firewall is on", "points": 20, "penalty": False}],
+                    "lost": [{"name": "Removed authorized user alice", "points": -10, "penalty": True}]}))
             vm_message(T["kind"], "results", {"posted": 200, "items": [
                 {"name": "Removed unauthorized user hacker", "points": 20, "earned": True},
                 {"name": "Firewall is on", "points": 20, "earned": True},
-                {"name": "x", "points": 20, "earned": False}]})
+                {"name": "x", "points": 20, "earned": False},
+                {"name": "Removed authorized user alice", "points": -10, "earned": True}]})
         if os.environ.get("PT_AGENT_SELFTEST_PRACTICE"):
             sel_var.set("Practice competition")   # exercise the practice controls path
             select_comp()
@@ -3027,6 +3369,9 @@ def run_cli(cfg, conf_dir, team_id, once, comp_id=None):
     cancel = threading.Event()
     if ccfg["kind"] in VM_OS_FOR_KIND:   # a Windows/Linux practice, on this (practice) machine
         prac = VMPractice(ccfg, team_id, lambda k, p: print(f"[{k}] {p}"), cancel)
+        if not read_marker() and not snapshot_noted():
+            print("[snapshot] A practice changes this VM's settings. To be able to reset it, take a Clean "
+                  f"snapshot before your first practice: {TAKE_SNAPSHOT}")
         prac.start()
         try:
             if once:

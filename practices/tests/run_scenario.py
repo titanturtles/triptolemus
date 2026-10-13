@@ -2,8 +2,10 @@
 """Run a practice scenario for real on a throwaway machine (CI: GitHub's Ubuntu / Windows runners),
 as root/administrator, using the agent's own engine:
   1. setup        -> nothing may score yet (every problem is in place)
-  2. the fixes    -> every check must score
-  3. setup again  -> nothing may score (setup forces each problem back, even on a hardened machine)
+  2. the fixes    -> every problem must score, and no penalty
+  3. the penalty script, if there is one (<name>.penalty.sh / .ps1 next to the fix script)
+                  -> every penalty must fire
+  4. setup again  -> nothing may score (setup forces each problem back, even on a hardened machine)
 Usage: run_scenario.py <scenario.json> <fix script>.   Never run this on a real computer."""
 import importlib.util, json, os, subprocess, sys
 
@@ -14,10 +16,11 @@ spec.loader.exec_module(A)
 
 
 def score(scen):
+    """-> (each problem's state, each penalty's state)"""
     items = A.ScenarioChecks().score(scen["checks"])
     for i in items:
         print(f"  [{'x' if i['earned'] else ' '}] {i['name']} ({i['points']})")
-    return [i["earned"] for i in items]
+    return ([i["earned"] for i in items if i["points"] >= 0], [i["earned"] for i in items if i["points"] < 0])
 
 
 def setup(scen):
@@ -25,6 +28,13 @@ def setup(scen):
     print(out + err)
     if code != 0:
         sys.exit(f"setup failed: exit {code}")
+
+
+def run(script):
+    argv = (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] if A.host_os() == "windows"
+            else ["bash", script])
+    if subprocess.run(argv).returncode != 0:
+        sys.exit(f"{script} failed")
 
 
 def main():
@@ -36,17 +46,25 @@ def main():
         sys.exit(f"{path} is for {scen['os']}, this is {A.host_os()}")
     bad = []
     print("== setup"); setup(scen)
-    if any(score(scen)):
-        bad.append("something already scores right after setup")
-    print("== fixes")
-    argv = (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fix] if A.host_os() == "windows"
-            else ["bash", fix])
-    if subprocess.run(argv).returncode != 0:
-        sys.exit("the fix script failed")
-    if not all(score(scen)):
-        bad.append("not every check scores after the fixes")
+    fixed, pens = score(scen)
+    if any(fixed) or any(pens):
+        bad.append("something already counts right after setup")
+    print("== fixes"); run(fix)
+    fixed, pens = score(scen)
+    if not all(fixed):
+        bad.append("not every problem scores after the fixes")
+    if any(pens):
+        bad.append("the fixes set off a penalty")
+    penalty = fix.replace(".fix.", ".penalty.")
+    if pens and os.path.exists(penalty):
+        print("== penalties"); run(penalty)
+        if not all(score(scen)[1]):
+            bad.append("not every penalty fires")
+    elif pens:
+        print(f"(no {os.path.basename(penalty)}: penalties not exercised)")
     print("== setup again (on the fixed machine)"); setup(scen)
-    if any(score(scen)):
+    fixed, pens = score(scen)
+    if any(fixed) or any(pens):
         bad.append("setup didn't put every problem back")
     if bad:
         sys.exit("FAILED: " + "; ".join(bad))

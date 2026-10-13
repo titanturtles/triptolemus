@@ -2,7 +2,7 @@
   "format": 1,
   "os": "windows",
   "title": "Windows Basics 1",
-  "readme": "Windows Basics 1\n\nYou are the administrator of this computer. A security review found problems. Fix them without breaking what the company needs.\n\nAuthorized administrators:\n  • you (the account you are logged in with)\n\nAuthorized users:\n  • alice\n  • bob\n\nCompany policy:\n  • Only authorized users may have accounts on this computer.\n  • Only authorized administrators may be in the Administrators group.\n  • The Guest account must be disabled.\n  • Windows Defender Firewall must be on for every network profile.\n  • Passwords must be at least 10 characters long.\n\nDo not delete authorized users. There are 5 problems, 20 points each. Your score updates in PT Comp about every 20 seconds.",
+  "readme": "Windows Basics 1\n\nYou are the administrator of this computer. A security review found problems. Fix them without breaking what the company needs.\n\nAuthorized administrators:\n  • you (the account you are logged in with)\n\nAuthorized users:\n  • alice\n  • bob\n\nCompany policy:\n  • Only authorized users may have accounts on this computer.\n  • Only authorized administrators may be in the Administrators group.\n  • The Guest account must be disabled.\n  • Windows Defender Firewall must be on for every network profile.\n  • Passwords must be at least 10 characters long.\n\nThere are 5 problems, 20 points each. Breaking what the company needs is a penalty: deleting an authorized user costs 10 points. Your score updates in PT Comp about every 20 seconds.",
   "setup": "$ErrorActionPreference = 'Stop'\n# Plants the 5 problems. Every problem is forced into place, so a VM someone already hardened\n# still starts the practice with all 5.\nfunction New-Pw { (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })) + 'Aa1!' }\nforeach ($u in 'alice', 'bob', 'hacker') {\n    $pw = ConvertTo-SecureString (New-Pw) -AsPlainText -Force\n    if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {\n        Set-LocalUser -Name $u -Password $pw\n    } else {\n        New-LocalUser -Name $u -Password $pw -PasswordNeverExpires | Out-Null\n    }\n    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $u -ErrorAction SilentlyContinue   # Users\n}\n# 1) hacker exists (unauthorized). 2) bob is an administrator, but only you should be.\nAdd-LocalGroupMember -SID 'S-1-5-32-544' -Member 'bob' -ErrorAction SilentlyContinue\n# 3) the Guest account is on\nGet-LocalUser | Where-Object { $_.SID.Value -like '*-501' } | Enable-LocalUser\n# 4) the firewall is off\nSet-NetFirewallProfile -Profile Domain, Private, Public -Enabled False\n# 5) any password length is accepted\nnet accounts /minpwlen:0 | Out-Null\nif ($LASTEXITCODE -ne 0) { throw \"net accounts failed ($LASTEXITCODE)\" }\n",
   "checks": [
     {
@@ -57,6 +57,26 @@
           "type": "SecurityPolicy",
           "key": "MinimumPasswordLength",
           "min": 10
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user alice",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "alice"
+        }
+      ]
+    },
+    {
+      "message": "Deleted the authorized user bob",
+      "points": -10,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "bob"
         }
       ]
     }

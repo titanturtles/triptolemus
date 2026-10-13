@@ -1,7 +1,8 @@
 name: Test practices (Windows + Linux)
 
 # Runs every Windows/Linux practice for real on throwaway runners: setup -> nothing scores,
-# the test fixes -> everything scores, setup again -> nothing scores. Run it from the Actions tab,
+# the test fixes -> everything scores, the penalty script -> every penalty fires, setup again ->
+# nothing scores. Run it from the Actions tab,
 # or it runs on pushes that change practices/ or the agent.
 
 on:
