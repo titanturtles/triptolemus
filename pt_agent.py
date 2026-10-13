@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.2"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.3"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1094,6 +1094,14 @@ def write_marker(info):
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, VM_MARKER), "w") as f:
         json.dump(info, f)
+
+
+def clear_marker():
+    """Forget which practice is set up on this VM (the student chose to set up here anyway)."""
+    try:
+        os.remove(os.path.join(vm_state_dir(), VM_MARKER))
+    except FileNotFoundError:
+        pass
 
 
 def marker_unfinished(mark):
@@ -2906,36 +2914,39 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             f"How: {TAKE_SNAPSHOT}\n\nDo you already have a Clean snapshot of this VM?"),
             [("yes", "Yes, start the practice"), ("later", "Not yet, I'll take it now"), (None, "Cancel")])
 
-    def go_back_to_clean(heading, why):
-        ask_choice("Go back to your Clean snapshot", heading,
-                   f"{why}\n\nHow: {RESTORE_SNAPSHOT}\n\nThen open PT Comp and click Start.", [("ok", "OK")])
-
     def vm_dirty_ok(T, mark, c):
-        """Start on a VM that already has a practice set up (mark): True to continue that practice;
-        otherwise the student is told to go back to the Clean snapshot first."""
+        """Start on a VM that already has a practice set up (mark). Returns True to go ahead (resume
+        it, or — if the student picks "set up here anyway" — forget the old marker and set up fresh on
+        the VM as it is). Restoring the Clean snapshot is the recommended path and gives a clean box."""
         there = mark.get("title") or mark.get("comp")
-        ans = "back"
+        picked = T["var"].get()
         if marker_unfinished(mark):
-            go_back_to_clean("This VM isn't clean", f"Setting up “{there}” didn't finish, so this VM is only "
-                             "partly changed. Go back to your Clean snapshot before starting a practice.")
+            ans = ask_choice("This VM isn't clean", "This VM isn't clean", (
+                f"Setting up “{there}” didn't finish, so this VM is only partly changed.\n\n"
+                f"Best: restore your Clean snapshot, then Start — that gives a clean machine. "
+                f"Or set up “{picked}” on this VM the way it is now.\n\nHow to restore: {RESTORE_SNAPSHOT}"),
+                [("restore", "I'll restore Clean"), ("anyway", "Set up here anyway"), (None, "Cancel")])
         elif mark.get("comp") != c.get("comp"):
-            go_back_to_clean("This VM isn't clean", f"This VM already has “{there}” set up. To start "
-                             f"“{T['var'].get()}”, go back to your Clean snapshot first.")
+            ans = ask_choice("This VM isn't clean", f"“{there}” is set up on this VM", (
+                f"To start “{picked}” on a clean machine, restore your Clean snapshot, then Start.\n\n"
+                f"Or set up “{picked}” on this VM the way it is now (its current changes stay in place).\n\n"
+                f"How to restore: {RESTORE_SNAPSHOT}"),
+                [("restore", "I'll restore Clean"), ("anyway", "Set up here anyway"), (None, "Cancel")])
         else:
             since = time.strftime(" on %b %d at %H:%M", time.localtime(mark["at"])) if mark.get("at") else ""
             ans = ask_choice("Practice already set up", f"“{there}” is already set up on this VM", (
                 f"It was set up{since}, and everything you changed since then is still on this VM.\n\n"
-                "Continue where you left off, or start over? Starting over means going back to your Clean "
-                "snapshot first."),
-                [("continue", "Continue where I left off"), ("over", "Start over"), (None, "Cancel")])
+                "Continue where you left off, or set it up again from scratch on this VM?"),
+                [("continue", "Continue where I left off"), ("anyway", "Set up again here"), (None, "Cancel")])
             if ans == "continue":
                 return True
-            if ans == "over":
-                go_back_to_clean("Start over from your Clean snapshot", "Going back to the Clean snapshot undoes "
-                                 "everything since the practice was set up; PT Comp then sets it up fresh.")
-        if ans:
-            status_var.set("Go back to your Clean snapshot, then click Start.")
-            logln("Not started: go back to your Clean snapshot first.")
+        if ans == "anyway":
+            clear_marker()
+            logln(f"Setting up “{picked}” on this VM.")
+            return True
+        if ans == "restore":
+            status_var.set("Restore your Clean snapshot, then click Start.")
+            logln("Not started: restore your Clean snapshot first.")
         return False
 
     def vm_note(T):
