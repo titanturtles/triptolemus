@@ -561,7 +561,7 @@ func adminCompetitions(w http.ResponseWriter, r *http.Request) {
 			"practice": cp.Practice, "private": cp.Private, "allowedTeams": cp.AllowedTeams,
 			"levels": len(cp.Levels), "submissions": countSubmissions(c.UploadDir, cp.ID),
 			"aiCheck": cp.AICheck, "aiFlagged": countAIFlagged(c, cp.ID),
-			"unit": cp.Unit, "levelInfo": info,
+			"unit": cp.Unit, "kind": kindName(cp.Kind), "levelInfo": info,
 		})
 	}
 	writeJSON(w, map[string]interface{}{"competitions": list})

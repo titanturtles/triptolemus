@@ -122,6 +122,23 @@ func TestScenarioCompetitions(t *testing.T) {
 		t.Fatalf("new agent enroll = %v", got)
 	}
 
+	// the scoreboard's competition list names each kind (for its Practice categories)
+	req0 := httptest.NewRequest("GET", "/admin/competitions", nil)
+	req0.Header.Set("X-Admin-Token", "a")
+	w0 := httptest.NewRecorder()
+	adminCompetitions(w0, req0)
+	var lst struct {
+		Competitions []struct{ ID, Kind string } `json:"competitions"`
+	}
+	json.Unmarshal(w0.Body.Bytes(), &lst)
+	kinds := map[string]string{}
+	for _, c := range lst.Competitions {
+		kinds[c.ID] = c.Kind
+	}
+	if kinds["cisco1"] != "cisco" || kinds["linux-basics-1"] != "linux" {
+		t.Fatalf("admin competitions kinds = %v", kinds)
+	}
+
 	// the level download keeps the scenario's extension (a practice level is always unlocked;
 	// the unreachable database just reads as no score)
 	scores = unreachableScores(t)
