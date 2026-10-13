@@ -3,9 +3,11 @@ package main
 // Level completion messages: the text an activity shows once it is complete (Packet Tracer's
 // "Overall Complete Feedback"), e.g. a password for the next round. PT only shows it under
 // Check Results, and the agent moves straight on to the next level, so /status passes it
-// along for every level the team has cleared.
+// along for every level the team has cleared. A Windows/Linux scenario carries its message
+// in "complete_message" (vmlevel.go).
 
 import (
+	"encoding/json"
 	"html"
 	"log"
 	"os"
@@ -45,9 +47,18 @@ func feedbackText(raw string) string {
 	return strings.Join(lines, "\n")
 }
 
-// readCompleteMessage decrypts a .pka with pka_tool and returns its completion message
-// ("" for none or PT's default). ok is false when the file couldn't be read.
+// readCompleteMessage returns a level file's completion message ("" for none or PT's
+// default): a .pka is decrypted with pka_tool, a scenario is read directly. ok is false when
+// the file couldn't be read.
 func readCompleteMessage(tool, pkaPath string) (text string, ok bool) {
+	if filepath.Ext(pkaPath) == ".json" {
+		var s scenario
+		data, err := os.ReadFile(pkaPath)
+		if err != nil || json.Unmarshal(data, &s) != nil {
+			return "", false
+		}
+		return strings.TrimSpace(s.CompleteMessage), true
+	}
 	if tool == "" {
 		return "", false
 	}

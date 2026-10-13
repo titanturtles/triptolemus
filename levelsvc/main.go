@@ -1,13 +1,14 @@
 // levelsvc: the Cisco Scoreboard Manager backend — multi-competition progressive
 // levels gating + deploy + review service, on the scoreboard box next to sarpedon.
 //
-// Each competition has an id, a name, a hidden flag, and its own ordered levels
-// (each a sarpedon image + clear-% + .pka). A level is released to a team only
-// once it cleared the previous level, read from sarpedon's Mongo `scores`.
+// Each competition has an id, a name, a hidden flag, a kind, and its own ordered levels
+// (each a sarpedon image + clear-% + level file). A level is released to a team only
+// once it cleared the previous level, read from sarpedon's Mongo `scores`. Cisco levels
+// are Packet Tracer .pka files; Windows and Linux levels are JSON scenarios (vmlevel.go).
 //
 //	GET  /status?comp=C&team=T          per-level score/cleared/unlocked (+ hidden, + each
 //	                                    cleared level's completion message; levelmsg.go)
-//	GET  /level?comp=C&team=T&n=N        the level-N .pka iff unlocked (else 403)
+//	GET  /level?comp=C&team=T&n=N        the level-N file iff unlocked (else 403)
 //	POST /upload?comp=C&team=T&n=N       store a finished .pka for review
 //	--- admin (header X-Admin-Token) ---
 //	GET  /admin/competitions             list competitions (+ level/submission counts)
@@ -81,6 +82,7 @@ type Competition struct {
 	AllowedTeams []string `json:"allowedTeams,omitempty"` // team IDs with early (pre-release) visibility
 	AICheck      bool     `json:"aiCheck,omitempty"`      // agents report AI-assistant use while a level runs (aiflags.go)
 	Unit         int      `json:"unit,omitempty"`         // course unit a practice belongs to (scoreboard groups practices by it)
+	Kind         string   `json:"kind,omitempty"`         // "" = Cisco (.pka levels), "windows" / "linux" (JSON scenarios; vmlevel.go)
 	Levels       []Level  `json:"levels"`
 }
 
@@ -428,7 +430,7 @@ func levelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="level%d.pka"`, n))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="level%d%s"`, n, filepath.Ext(lvl.File)))
 	io.Copy(w, f)
 	log.Printf("served comp=%s level=%d team=%s", cp.ID, n, team)
 }
@@ -1197,6 +1199,11 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 	hasAI := r.FormValue("aiopt") != "" // this client manages the AI-use check (else leave it unchanged)
 	aiCheck := r.FormValue("aiCheck") != ""
 	unit, hasUnit := formUnit(r)
+	kind, ok := normKind(r.FormValue("kind"))
+	if !ok {
+		http.Error(w, "kind must be cisco, windows or linux", 400)
+		return
+	}
 	// deferImages: register the competition but leave sarpedon.conf alone; a later
 	// /admin/syncimages writes every pending [[image]] block at once (one sarpedon
 	// restart for a bulk import instead of one per competition).
@@ -1220,14 +1227,23 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		data, _ := io.ReadAll(f)
 		f.Close()
+		if kind != "" {
+			if err := checkScenario(kind, data); err != nil {
+				http.Error(w, fmt.Sprintf("level %d: %v", i, err), 400)
+				return
+			}
+		}
 		image := uniqueImage(slugImage(comp, i, fhs[0].Filename), taken)
-		fn := image + ".pka"
+		fn := image + levelExt(kind)
 		pkaPath := filepath.Join(dir, fn)
 		if err := os.WriteFile(pkaPath, data, 0644); err != nil {
 			http.Error(w, "cannot store level file: "+err.Error(), 500)
 			return
 		}
-		hash := pkaHash(c.PkaTool, pkaPath)
+		hash := ""
+		if kind == "" {
+			hash = pkaHash(c.PkaTool, pkaPath)
+		}
 		key := "ptk_" + randHex(16)
 		thr, _ := strconv.Atoi(strings.TrimSpace(r.FormValue(fmt.Sprintf("threshold%d", i))))
 		if thr <= 0 {
@@ -1242,7 +1258,7 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 		sarpBlocks.WriteString(imageBlock(image, key, practice))
 	}
 	if len(newLevels) == 0 {
-		http.Error(w, "upload at least one .pka (field level1, level2, ...)", 400)
+		http.Error(w, "upload at least one level file (field level1, level2, ...)", 400)
 		return
 	}
 
@@ -1262,12 +1278,13 @@ func adminCreate(w http.ResponseWriter, r *http.Request) {
 			if hasUnit {
 				cfg.Competitions[i].Unit = unit
 			}
+			cfg.Competitions[i].Kind = kind
 			cfg.Competitions[i].Levels = newLevels
 			found = true
 		}
 	}
 	if !found {
-		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, AICheck: aiCheck, Unit: unit, Levels: newLevels})
+		cfg.Competitions = append(cfg.Competitions, Competition{ID: comp, Name: name, Practice: practice, Private: private, AllowedTeams: allowed, AICheck: aiCheck, Unit: unit, Kind: kind, Levels: newLevels})
 	}
 	persistLocked()
 	cfgMu.Unlock()
@@ -1319,9 +1336,11 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 	taken := takenImages(c, "") // kept levels keep their names; new uploads must avoid them
 	byImage := map[string]Level{}
 	found := false
+	kind := ""
 	for _, cp := range c.Competitions {
 		if cp.ID == comp {
 			found = true
+			kind = cp.Kind
 			for _, l := range cp.Levels {
 				byImage[l.Image] = l
 			}
@@ -1360,13 +1379,22 @@ func adminUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			data, _ := io.ReadAll(f)
 			f.Close()
+			if kind != "" {
+				if err := checkScenario(kind, data); err != nil {
+					http.Error(w, fmt.Sprintf("level %d: %v", k, err), 400)
+					return
+				}
+			}
 			image := uniqueImage(slugImage(comp, k, fhs[0].Filename), taken)
-			fn := image + ".pka"
+			fn := image + levelExt(kind)
 			if err := os.WriteFile(filepath.Join(dir, fn), data, 0644); err != nil {
 				http.Error(w, "cannot store level file: "+err.Error(), 500)
 				return
 			}
-			hash := pkaHash(c.PkaTool, filepath.Join(dir, fn))
+			hash := ""
+			if kind == "" {
+				hash = pkaHash(c.PkaTool, filepath.Join(dir, fn))
+			}
 			key := "ptk_" + randHex(16)
 			if lvName == "" {
 				lvName = fmt.Sprintf("Level %d", k)
@@ -1682,8 +1710,9 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	comps := []map[string]interface{}{}
 	def := ""
+	kinds := agentKinds(r.URL.Query().Get("kinds"))
 	for _, cp := range c.Competitions {
-		if cp.Hidden {
+		if cp.Hidden || !kinds[kindName(cp.Kind)] {
 			continue
 		}
 		// Private competitions still appear in the list (show-but-lock): the play
@@ -1699,7 +1728,7 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		comps = append(comps, map[string]interface{}{"comp": cp.ID, "name": cp.Name, "practice": cp.Practice,
-			"ai_check": cp.AICheck, "levels": levels})
+			"ai_check": cp.AICheck, "kind": kindName(cp.Kind), "levels": levels})
 	}
 	if def == "" && len(comps) > 0 {
 		def = comps[0]["comp"].(string) // fall back to the first visible competition
