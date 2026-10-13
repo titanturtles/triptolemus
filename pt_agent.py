@@ -28,7 +28,7 @@ Students only ever enter their Team ID; everything else lives in this config.
 Packet Tracer setup (once per machine): Extensions > IPC > Configure Apps > Add
 the ptagent.pta file, then quit PT normally so it saves. Launch PT before Start.
 """
-import argparse, hashlib, json, os, platform, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+import argparse, base64, hashlib, json, os, platform, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, threading, time, uuid
 import urllib.parse, urllib.request, urllib.error
 
 try:
@@ -41,7 +41,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.1.13"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.0"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -365,12 +365,16 @@ class LevelsClient:
         with urllib.request.urlopen(self.base + "/status?" + urllib.parse.urlencode(q), timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
-    def download(self, team, comp, n, dest):
+    def fetch(self, team, comp, n):
+        """The level-n file (a .pka, or a Windows/Linux scenario) as bytes."""
         q = {"team": team, "n": n}
         if comp:
             q["comp"] = comp
         with urllib.request.urlopen(self.base + "/level?" + urllib.parse.urlencode(q), timeout=self.timeout) as r:
-            data = r.read()
+            return r.read()
+
+    def download(self, team, comp, n, dest):
+        data = self.fetch(team, comp, n)
         with open(dest, "wb") as f:
             f.write(data)
         return len(data)
@@ -559,8 +563,23 @@ def load_state(base_dir):
 
 def save_state(base_dir, state):
     try:
-        with open(os.path.join(base_dir, STATE_FILE), "w") as f:
+        path = os.path.join(base_dir, STATE_FILE)
+        with open(path, "w") as f:
             json.dump(state, f)
+        _give_back(path)
+    except Exception:
+        pass
+
+
+def _give_back(path):
+    """A root copy of the app (pkexec or sudo, for a Linux practice) hands a file it wrote in the
+    student's folder back to the student, so their normal copy can still update it."""
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    if not uid or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    try:
+        import pwd
+        os.chown(path, int(uid), pwd.getpwuid(int(uid)).pw_gid)
     except Exception:
         pass
 
@@ -584,6 +603,19 @@ def reset_local(base_dir):
 
 
 # ---------------- competition orchestrator ----------------
+def active_level(levels_client, team, comp):
+    """Return (level_number, levels) for the level the student should be on now."""
+    st = levels_client.status(team, comp)
+    levels = st.get("levels", [])
+    active = next((l for l in levels if l.get("unlocked") and not l.get("cleared")), None)
+    if active:
+        return active["level"], levels
+    unlocked = [l for l in levels if l.get("unlocked")]
+    if unlocked:
+        return unlocked[-1]["level"], levels   # everything cleared: stay on the last one
+    return (levels[0]["level"] if levels else None), levels
+
+
 class Competition:
     """Drives one competition. The GUI calls start()/stop()/finish(); a scoring-loop
     thread posts live scores and auto-advances levels. report(kind, payload) kinds:
@@ -669,16 +701,7 @@ class Competition:
             raise last
 
     def _active_level(self):
-        """Return (level_number, levels) for the level the student should be on now."""
-        st = self.levels.status(self.team, self.comp)
-        levels = st.get("levels", [])
-        active = next((l for l in levels if l.get("unlocked") and not l.get("cleared")), None)
-        if active:
-            return active["level"], levels
-        unlocked = [l for l in levels if l.get("unlocked")]
-        if unlocked:
-            return unlocked[-1]["level"], levels   # everything cleared: stay on the last one
-        return (levels[0]["level"] if levels else None), levels
+        return active_level(self.levels, self.team, self.comp)
 
     def _load_level(self, lvl, fresh):
         """Open a level in PT. fresh=False tries the student's saved progress first."""
@@ -968,11 +991,459 @@ class Competition:
         self.report("error", msg)
 
 
+# ---------------- Windows / Linux practices (inside the student's practice VM) ----------------
+# A Windows or Linux practice level is a JSON scenario served by levelsvc:
+#   {"os": "windows" | "linux" | "freebsd", "title": ..., "readme": text for the student,
+#    "setup": script that plants the problems (PowerShell on Windows, bash elsewhere),
+#    "checks": [{"message": ..., "points": N, "pass": [condition, ...], "fail": [condition, ...]}],
+#    "complete_message": optional text shown once the level is cleared}
+# A check is earned when every "pass" condition holds and no "fail" condition does. Condition
+# types follow aeacus (Command, CommandContains, CommandOutput, FileContains, PathExists,
+# UserExists, UserInGroup, FirewallUp, ServiceUp, PermissionIs, SecurityPolicy), each also with a
+# "Not" form, and a condition that errors counts as false even in its "Not" form, as in aeacus.
+# Setup and checks change and read system settings, so the agent runs as administrator/root.
+# Students set a practice up on a VM restored to its Clean snapshot; a marker file records which
+# level is set up, so a different one only loads after another restore.
+VM_OS_FOR_KIND = {"windows": ("windows",), "linux": ("linux", "freebsd")}
+VM_INTERVAL = 20  # seconds between scoring runs (a Windows check starts PowerShell)
+VM_MARKER = "practice.json"
+
+
+class PracticeError(Exception):
+    pass
+
+
+def host_os():
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("freebsd"):
+        return "freebsd"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def is_admin():
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def vm_state_dir():
+    """Where the practice marker lives (only an administrator can write there)."""
+    if os.environ.get("PT_AGENT_VM_STATE_DIR"):  # tests
+        return os.environ["PT_AGENT_VM_STATE_DIR"]
+    if sys.platform.startswith("win"):
+        return os.path.join(os.environ.get("ProgramData") or r"C:\ProgramData", "TitanTurtles")
+    return "/var/lib/titanturtles"
+
+
+def read_marker():
+    try:
+        with open(os.path.join(vm_state_dir(), VM_MARKER)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_marker(info):
+    d = vm_state_dir()
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, VM_MARKER), "w") as f:
+        json.dump(info, f)
+
+
+def run_script(script, timeout=60):
+    """Run a scenario script: PowerShell on Windows, bash (or sh) elsewhere.
+    Returns (exit code, stdout, stderr)."""
+    tmp = None
+    if sys.platform.startswith("win"):
+        script = "$ProgressPreference = 'SilentlyContinue'\n" + script
+        argv = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+        if len(script) < 8000:
+            argv += ["-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
+        else:  # past the command-line limit: run it from a file
+            fd, tmp = tempfile.mkstemp(suffix=".ps1", prefix="ptagent_")
+            with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+                f.write(script)
+            argv += ["-File", tmp]
+    else:
+        argv = [shutil.which("bash") or "/bin/sh", "-c", script]
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, **NO_WINDOW)
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def _ps(s):
+    """A PowerShell single-quoted string literal."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+# built-in Windows groups by SID, so a check naming "Administrators" also works on a Windows
+# whose groups have translated names
+WIN_GROUP_SIDS = {"administrators": "S-1-5-32-544", "users": "S-1-5-32-545", "guests": "S-1-5-32-546",
+                  "power users": "S-1-5-32-547", "backup operators": "S-1-5-32-551",
+                  "remote desktop users": "S-1-5-32-555"}
+
+
+def read_security_policy():
+    """Windows local security policy as {key: value} (secedit export, e.g. MinimumPasswordLength)."""
+    fd, path = tempfile.mkstemp(suffix=".inf", prefix="ptagent_")
+    os.close(fd)
+    try:
+        subprocess.run(["secedit", "/export", "/cfg", path, "/areas", "SECURITYPOLICY", "/quiet"],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=60, **NO_WINDOW)
+        with open(path, "rb") as f:
+            raw = f.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8", "replace")
+    pol = {}
+    for line in text.splitlines():
+        if "=" in line and not line.lstrip().startswith(("[", ";")):
+            k, v = line.split("=", 1)
+            pol[k.strip()] = v.strip()
+    if not pol:
+        raise PracticeError("could not read the security policy")
+    return pol
+
+
+class ScenarioChecks:
+    """Evaluates a scenario's checks on this machine. Use one per scoring run, so slow reads
+    (the Windows security policy) happen once per run."""
+    def __init__(self):
+        self.win = sys.platform.startswith("win")
+        self._secpol = None
+
+    def score(self, checks):
+        """-> [{"name", "points", "earned"}] in the scenario's order."""
+        out = []
+        for ch in checks:
+            want, bad = ch.get("pass") or [], ch.get("fail") or []
+            earned = bool(want or bad) and all(self.cond(c) for c in want) and not any(self.cond(c) for c in bad)
+            out.append({"name": ch.get("message") or "Fixed a problem", "points": int(ch.get("points", 0)),
+                        "earned": earned})
+        return out
+
+    def cond(self, c):
+        t = str(c.get("type", ""))
+        neg = t.endswith("Not")
+        base = t[:-3] if neg else t
+        regex = base.endswith("Regex") or bool(c.get("regex"))
+        base = base[:-5] if base.endswith("Regex") else base
+        fn = getattr(self, "_" + base, None)
+        if not fn:
+            return False
+        try:
+            ok = bool(fn(c, regex))
+        except Exception:
+            return False  # an error is false, in the "Not" form too
+        return not ok if neg else ok
+
+    def _sh(self, cmd):
+        code, out, _err = run_script(cmd, timeout=30)
+        return code, out
+
+    def _ps_bool(self, script):
+        """A PowerShell probe that exits 0 for true and 3 for false; anything else is an error."""
+        code, out = self._sh(script)
+        if code not in (0, 3):
+            raise PracticeError(f"check failed (exit {code}): {out.strip()[-200:]}")
+        return code == 0
+
+    @staticmethod
+    def _match(text, want, regex):
+        return bool(re.search(want, text, re.M)) if regex else str(want) in text
+
+    def _Command(self, c, regex):
+        return self._sh(c["cmd"])[0] == 0
+
+    def _CommandContains(self, c, regex):
+        return self._match(self._sh(c["cmd"])[1], c["value"], regex)
+
+    def _CommandOutput(self, c, regex):
+        return self._sh(c["cmd"])[1].strip() == str(c["value"]).strip()
+
+    def _FileContains(self, c, regex):
+        with open(c["path"], encoding="utf-8", errors="replace") as f:
+            return self._match(f.read(), c["value"], regex)
+
+    def _PathExists(self, c, regex):
+        return os.path.exists(c["path"])
+
+    def _UserExists(self, c, regex):
+        if self.win:
+            return self._ps_bool(f"if (Get-LocalUser -Name {_ps(c['user'])} -ErrorAction SilentlyContinue) "
+                                 "{ exit 0 } else { exit 3 }")
+        import pwd
+        try:
+            pwd.getpwnam(c["user"])
+            return True
+        except KeyError:
+            return False
+
+    def _UserInGroup(self, c, regex):
+        user, group = c["user"], c["group"]
+        if self.win:
+            sid = WIN_GROUP_SIDS.get(group.lower())
+            g = f"Get-LocalGroup -SID {_ps(sid)}" if sid else f"Get-LocalGroup -Name {_ps(group)}"
+            # ADSI lists members even when the group holds a stale SID (Get-LocalGroupMember fails on those)
+            return self._ps_bool(
+                f"$g = {g} -ErrorAction Stop\n"
+                "$m = ([ADSI](\"WinNT://$env:COMPUTERNAME/\" + $g.Name + ',group')).psbase.Invoke('Members') | "
+                "ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) }\n"
+                f"if (@($m) -contains {_ps(user)}) {{ exit 0 }} else {{ exit 3 }}")
+        import grp, pwd
+        g = grp.getgrnam(group)
+        if user in g.gr_mem:
+            return True
+        try:
+            return pwd.getpwnam(user).pw_gid == g.gr_gid
+        except KeyError:
+            return False
+
+    def _FirewallUp(self, c, regex):
+        if self.win:
+            return self._ps_bool("$off = @(Get-NetFirewallProfile -ErrorAction Stop | "
+                                 "Where-Object { \"$($_.Enabled)\" -ne 'True' })\n"
+                                 "if ($off.Count -eq 0) { exit 0 } else { exit 3 }")
+        try:
+            with open("/etc/ufw/ufw.conf") as f:
+                if re.search(r"^\s*ENABLED\s*=\s*yes", f.read(), re.M | re.I):
+                    return True
+        except FileNotFoundError:
+            pass
+        if shutil.which("systemctl"):
+            return subprocess.run(["systemctl", "is-active", "--quiet", "firewalld"],
+                                  capture_output=True, timeout=30).returncode == 0
+        return False
+
+    def _ServiceUp(self, c, regex):
+        name = c["name"]
+        if self.win:
+            return self._ps_bool(f"if ((Get-Service -Name {_ps(name)} -ErrorAction Stop).Status -eq 'Running') "
+                                 "{ exit 0 } else { exit 3 }")
+        argv = (["systemctl", "is-active", "--quiet", name] if shutil.which("systemctl")
+                else ["service", name, "status"])
+        return subprocess.run(argv, capture_output=True, timeout=30).returncode == 0
+
+    def _PermissionIs(self, c, regex):
+        """aeacus-style mode pattern, '?' matching anything: "-rw-r-----", or "???????---" for
+        "no access for others". A 9-character pattern skips the file-type character."""
+        if self.win:
+            raise PracticeError("PermissionIs is for Linux/FreeBSD")
+        mode = stat.filemode(os.stat(c["path"]).st_mode)
+        want = c["value"]
+        if len(want) == 9:
+            mode = mode[1:]
+        return len(want) == len(mode) and all(w in ("?", m) for w, m in zip(want, mode))
+
+    def _SecurityPolicy(self, c, regex):
+        """{"key": "MinimumPasswordLength", "min": 10} (or "max", or an exact "value")."""
+        if not self.win:
+            raise PracticeError("SecurityPolicy is for Windows")
+        if self._secpol is None:
+            self._secpol = read_security_policy()
+        v = self._secpol[c["key"]]
+        if "min" in c or "max" in c:
+            n = int(v)
+            return ("min" not in c or n >= int(c["min"])) and ("max" not in c or n <= int(c["max"]))
+        return v.strip().lower() == str(c["value"]).strip().lower()
+
+
+class VMPractice:
+    """Drives one Windows/Linux practice inside the student's practice VM: sets the level's
+    scenario up (once, on a VM restored to its Clean snapshot), then scores it every
+    VM_INTERVAL seconds and posts the score like a Cisco level. report(kind, payload) kinds:
+    'log', 'status', 'error', 'state' ('idle' / 'running'), 'cards' (server level status),
+    'readme' ({'title', 'text'}), 'results' (the checks after a scoring run),
+    'cleared' ({'level', 'text', 'next', 'popup'})."""
+    def __init__(self, cfg, team_id, report, cancel):
+        self.cfg, self.team, self.report, self.cancel = cfg, team_id, report, cancel
+        self.comp = cfg.get("comp", "")
+        self.name = cfg.get("name") or self.comp
+        self.levels = LevelsClient(cfg["levelsvc"])
+        self.current = None
+        self.scenario = None
+        self.loop_stop = None
+        self.loop_thread = None
+        self.cleared_noted = set()
+        self.primed = False   # first status seen; later clears are new (popup)
+
+    def level_cfg(self, n):
+        return next((l for l in self.cfg["levels"] if int(l["level"]) == int(n)), None)
+
+    def start(self):
+        try:
+            if not is_admin():
+                raise PracticeError("This practice changes system settings, so PT Comp has to run as "
+                                    + ("administrator." if sys.platform.startswith("win") else "root."))
+            lvl, _levels = active_level(self.levels, self.team, self.comp)
+            if lvl is None:
+                raise PracticeError("This practice has no levels yet.")
+            lc = self.level_cfg(lvl)
+            if not lc:
+                raise PracticeError(f"Level {lvl} is missing from the practice list. Click Reload.")
+            scen = json.loads(self.levels.fetch(self.team, self.comp, lvl).decode("utf-8"))
+            if scen.get("os") != host_os():
+                raise PracticeError(f"This practice is for {scen.get('os')}, but this computer runs {host_os()}.")
+            title = f"{self.name}: {lc.get('name') or f'Level {lvl}'}"
+            here = {"comp": self.comp, "level": lvl, "image": lc["image"]}
+            mark = read_marker()
+            if mark and all(mark.get(k) == v for k, v in here.items()):
+                self.report("log", f"{title} is already set up on this VM. Resuming scoring.")
+            elif mark:
+                raise PracticeError(
+                    f"This VM already has “{mark.get('title') or mark.get('comp')}” set up.\n\n"
+                    "To load a different practice or level, restore your VM's Clean snapshot "
+                    "(VirtualBox: Snapshots → Clean → Restore), start the VM, then open PT Comp "
+                    "and click Start again.")
+            else:
+                self._setup(scen, title)
+                write_marker(dict(here, title=title, team=self.team, at=int(time.time())))
+            self.current, self.scenario = lvl, scen
+            self.report("readme", {"title": title, "text": scen.get("readme", "")})
+        except PracticeError as e:
+            return self._fail(str(e))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", "replace").strip()
+            except Exception:
+                detail = ""
+            return self._fail(f"The server refused the practice (HTTP {e.code}). {detail}")
+        except Exception as e:
+            return self._fail(f"Could not start the practice:\n\n{e}")
+        self.loop_stop = threading.Event()
+        self.loop_thread = threading.Thread(target=self._loop, daemon=True)
+        self.loop_thread.start()
+        self.report("status", f"Working on {self.name}, level {self.current}. Your score updates every "
+                              f"{VM_INTERVAL} seconds.")
+        self.report("state", "running")
+
+    def _fail(self, msg):
+        self.report("log", msg.replace("\n\n", " "))
+        self.report("error", msg)
+        self.report("status", "Not started.")
+        self.report("state", "idle")
+
+    def _setup(self, scen, title):
+        self.report("status", f"Setting up {title}. This can take a minute…")
+        self.report("log", f"Setting up {title}…")
+        code, out, err = run_script(scen.get("setup", ""), timeout=900)
+        if code != 0:
+            raise PracticeError(f"The practice setup failed (exit code {code}).\n\n{(err or out).strip()[-600:]}\n\n"
+                                "Restore your Clean snapshot and try again. Tell your instructor if it keeps failing.")
+        # setup puts every problem in place, so nothing may count as fixed yet
+        done = [r["name"] for r in ScenarioChecks().score(scen.get("checks", [])) if r["earned"]]
+        if done:
+            raise PracticeError("The practice didn't start cleanly. These already count as fixed:\n\n• "
+                                + "\n• ".join(done) + "\n\nRestore your Clean snapshot and click Start again.")
+        self.report("log", "Setup done. Every problem is in place. Go!")
+
+    def _loop(self):
+        lc = self.level_cfg(self.current)
+        checks = self.scenario.get("checks", [])
+        while not self.loop_stop.is_set() and not self.cancel.is_set():
+            try:
+                items = ScenarioChecks().score(checks)
+            except Exception as e:
+                self.report("log", f"Scoring error: {e}")
+                items = None
+            if items is not None and not self.loop_stop.is_set():
+                done = sum(1 for i in items if i["earned"])
+                pts = sum(i["points"] for i in items if i["earned"])
+                pct = done * 100.0 / len(items) if items else 0.0
+                code = post_update(self.cfg["remote"], build_update(lc["password"], self.team, lc["image"],
+                                                                    pct, done, len(items), items))
+                self.report("results", {"level": self.current, "items": items, "posted": code})
+                self.report("log", f"Level {self.current}: {done}/{len(items)} fixed, "
+                                   f"{pts}/{sum(i['points'] for i in items)} pts -> "
+                                   + ("OK" if code == 200 else f"rejected({code})"))
+            try:
+                levels = self.levels.status(self.team, self.comp).get("levels", [])
+                self.report("cards", {"levels": levels, "active": self.current})
+                self._note_cleared(levels)
+            except Exception as e:
+                self.report("log", f"levels service unreachable: {e}")
+            self.loop_stop.wait(VM_INTERVAL)
+
+    def _note_cleared(self, levels):
+        """Tell the GUI once when the current level is cleared (a popup only for a new clear)."""
+        for l in levels:
+            n = l.get("level")
+            if n == self.current and l.get("cleared") and n not in self.cleared_noted:
+                self.cleared_noted.add(n)
+                nxt = next((x["level"] for x in levels if x["level"] > n and not x.get("cleared")), None)
+                self.report("cleared", {"level": n, "text": (l.get("message") or "").strip(), "next": nxt,
+                                        "popup": self.primed})
+        self.primed = True
+
+    def stop(self):
+        if self.loop_stop:
+            self.loop_stop.set()
+        if self.loop_thread:
+            self.loop_thread.join(timeout=60)  # a scoring run may be under way
+        self.loop_thread = None
+        self.report("status", "Scoring stopped. Click Start to continue; your VM keeps its changes.")
+        self.report("state", "idle")
+
+
+def relaunch_elevated(cfg_path, tab):
+    """Start an administrator (Windows) or root (Linux, via pkexec) copy of the app on the given
+    tab; Windows/Linux practices need one. Returns (process, error): on Linux the pkexec process
+    to watch, on Windows None once the copy is started; error is "" on success."""
+    args = ["-c", os.path.abspath(cfg_path), "--tab", tab, "--no-update"]
+    if getattr(sys, "frozen", False):
+        exe, params = sys.executable, args
+    else:
+        exe, params = sys.executable, [os.path.abspath(__file__)] + args
+    env = _relaunch_env()  # a one-file build's copy must not inherit its _PYI_* variables
+    if sys.platform.startswith("win"):
+        import ctypes
+        for k in [k for k in os.environ if k not in env]:
+            del os.environ[k]
+        os.environ.update(env)
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subprocess.list2cmdline(params),
+                                                 os.path.dirname(os.path.abspath(cfg_path)), 1)
+        if rc <= 32:
+            return None, "Windows didn't start PT Comp as administrator (the prompt was cancelled or blocked)."
+        return None, ""
+    pk = shutil.which("pkexec")
+    if not pk:
+        return None, ("pkexec isn't installed. Open a terminal and run:\n\nsudo "
+                      + " ".join(shlex.quote(a) for a in [exe] + params))
+    keep = {k: env[k] for k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG",
+                                "PYINSTALLER_RESET_ENVIRONMENT") if env.get(k)}
+    if "XAUTHORITY" not in keep and os.path.exists(os.path.expanduser("~/.Xauthority")):
+        keep["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
+    argv = [pk, "env"] + [f"{k}={v}" for k, v in keep.items()] + [exe] + params
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return None, f"Could not start PT Comp as root: {e}"
+    return p, ""
+
+
 # ---------------- enrollment (competition set from the server) ----------------
 def fetch_enroll(levelsvc_base, token, timeout=20):
-    """GET /enroll with the shared class token -> the full competition set + default."""
+    """GET /enroll with the shared class token -> the full competition set + default. Naming the
+    kinds this agent plays gets the Windows/Linux practices too (older agents only get Cisco)."""
     base = levelsvc_base.rstrip("/")
-    req = urllib.request.Request(base + "/enroll", headers={"X-Class-Token": token})
+    req = urllib.request.Request(base + "/enroll?kinds=cisco,windows,linux", headers={"X-Class-Token": token})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
@@ -1005,6 +1476,8 @@ def comp_cfg(shared, competition):
     """Build a single-competition cfg (the shape the Competition class expects)."""
     c = dict(shared)
     c["comp"] = competition.get("comp", "")
+    c["name"] = competition.get("name") or c["comp"]
+    c["kind"] = competition.get("kind") or "cisco"
     c["practice"] = bool(competition.get("practice", False))
     c["ai_check"] = bool(competition.get("ai_check", False))
     c["levels"] = competition.get("levels", [])
@@ -1691,7 +2164,7 @@ class AIWatcher:
 
 
 # ---------------- GUI ----------------
-def run_gui(cfg, conf_dir):
+def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
     import threading, queue
     import tkinter as tk
     from tkinter import ttk, scrolledtext, messagebox
@@ -1701,8 +2174,9 @@ def run_gui(cfg, conf_dir):
     server_served = bool(cfg.get("class_token"))  # bootstrap config pulls competitions from the server
 
     root = tk.Tk()
-    root.title(f"PT Comp (v{AGENT_VERSION})")
-    root.geometry("680x600")
+    root.title(f"PT Comp (v{AGENT_VERSION})" + (" — administrator" if is_admin() else ""))
+    GEOM = "700x720"
+    root.geometry(GEOM)
 
     # Open at a normal size even if the window manager tries to maximize a new window on
     # autostart. The window stays resizable; we just clear any maximized state right after
@@ -1716,11 +2190,29 @@ def run_gui(cfg, conf_dir):
             root.state("normal")
         except Exception:
             pass
-        root.geometry("680x600")
+        root.geometry(GEOM)
     for _d in (80, 400, 1000):
         root.after(_d, _nomaximize)
+    # Team ID and the server buttons are shared by every tab
+    topbar = ttk.Frame(root, padding=(10, 8, 10, 0))
+    topbar.pack(fill="x")
+    ttk.Label(topbar, text="Team ID:").pack(side="left")
+    team_var = tk.StringVar(value=state.get("team_id", cfg.get("team_id", "")))
+    ttk.Entry(topbar, textvariable=team_var, width=30).pack(side="left", padx=6)
+    # anchor Reset + Reload on the right so they're always visible
+    reset_btn = ttk.Button(topbar, text="Reset (new student)")  # command wired below
+    reset_btn.pack(side="right", padx=(6, 0))
+    reload_btn = ttk.Button(topbar, text="Reload")  # command wired below
+    reload_btn.pack(side="right")
+
+    # one tab per kind of practice: Cisco (Packet Tracer), Windows and Linux (in a practice VM)
+    nb = ttk.Notebook(root)
+    nb.pack(fill="x", padx=8, pady=(8, 0))
+    cisco_tab = ttk.Frame(nb)
+    nb.add(cisco_tab, text="Cisco")
+
     intro = ttk.Label(
-        root, wraplength=580, justify="left", foreground="#2f5e97", padding=(10, 8, 10, 0),
+        cisco_tab, wraplength=600, justify="left", foreground="#2f5e97", padding=(10, 8, 10, 0),
         text="How to use:   1) Open Packet Tracer (register the agent once: Extensions → IPC → "
              "Configure Apps → Add).   2) Enter your Team ID and click Start — your level opens "
              "automatically.   3) Work in Packet Tracer; clearing a level unlocks the next.   "
@@ -1754,27 +2246,22 @@ def run_gui(cfg, conf_dir):
         win.lift()
         win.focus_force()
 
-    helpbar = ttk.Frame(root, padding=(10, 0, 10, 2))
+    helpbar = ttk.Frame(cisco_tab, padding=(10, 4, 10, 2))
     helpbar.pack(anchor="w", fill="x")
     ttk.Button(helpbar, text="First-time setup (register the agent)…", command=show_setup_help).pack(side="left")
 
     # competition selector — populated from the server on open (Reload re-fetches)
     ENR = {"shared": dict(cfg), "comps": [], "by_name": {}}
     sel_var = tk.StringVar()
-    compbar = ttk.Frame(root, padding=(10, 0, 10, 2))
+    compbar = ttk.Frame(cisco_tab, padding=(10, 0, 10, 2))
     compbar.pack(anchor="w", fill="x")
     ttk.Label(compbar, text="Competition:").pack(side="left")
-    combo = ttk.Combobox(compbar, textvariable=sel_var, state="readonly", width=28)
+    combo = ttk.Combobox(compbar, textvariable=sel_var, state="readonly", width=34)
     combo.pack(side="left", padx=6)
-    # anchor Reset + Reload on the right so they're always visible
-    reset_btn = ttk.Button(compbar, text="Reset (new student)")  # command wired below
-    reset_btn.pack(side="right", padx=(6, 0))
-    reload_btn = ttk.Button(compbar, text="Reload")  # command wired below
-    reload_btn.pack(side="right")
 
     # practice-only controls (shown by select_comp when the chosen competition is practice):
     # an "Unlock all levels" toggle + a level picker so the student can jump around freely.
-    practicebar = ttk.Frame(root, padding=(10, 0, 10, 2))
+    practicebar = ttk.Frame(cisco_tab, padding=(10, 0, 10, 2))
     free_switch_var = tk.BooleanVar(value=False)
     LEVELPICK = {}  # label -> level number
     practice_chk = ttk.Checkbutton(practicebar, text="Unlock all levels (practice)",
@@ -1787,12 +2274,8 @@ def run_gui(cfg, conf_dir):
     goto_btn = ttk.Button(practicebar, text="Go", state="disabled")  # command wired below
     goto_btn.pack(side="left")
 
-    frm = ttk.Frame(root, padding=10)
+    frm = ttk.Frame(cisco_tab, padding=(10, 4, 10, 8))
     frm.pack(fill="both", expand=True)
-
-    ttk.Label(frm, text="Team ID:").grid(row=0, column=0, sticky="w", pady=4)
-    team_var = tk.StringVar(value=state.get("team_id", cfg.get("team_id", "")))
-    ttk.Entry(frm, textvariable=team_var, width=36).grid(row=0, column=1, sticky="we", pady=4)
 
     # level cards (rebuilt whenever the selected competition changes)
     cards_frame = ttk.LabelFrame(frm, text="Levels", padding=8)
@@ -1802,17 +2285,18 @@ def run_gui(cfg, conf_dir):
     level_names = {}
     msg_boxes = {}
 
-    status_var = tk.StringVar(value="Idle. Open Packet Tracer, then enter your Team ID and Start.")
-    ttk.Label(frm, textvariable=status_var, foreground="#2f5e97").grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
-
-    log = scrolledtext.ScrolledText(frm, height=12, width=72, state="disabled", font=("TkFixedFont", 9))
-    log.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=6)
-    frm.rowconfigure(4, weight=1)
     frm.columnconfigure(1, weight=1)
 
+    # status line + log under the tabs, shared by all of them
+    bottom = ttk.Frame(root, padding=(10, 4, 10, 4))
+    bottom.pack(fill="both", expand=True)
+    status_var = tk.StringVar(value="Idle. Enter your Team ID, pick a tab, and Start.")
+    ttk.Label(bottom, textvariable=status_var, foreground="#2f5e97", wraplength=660,
+              justify="left").pack(anchor="w", pady=(2, 2))
+    log = scrolledtext.ScrolledText(bottom, height=7, width=72, state="disabled", font=("TkFixedFont", 9))
+    log.pack(fill="both", expand=True, pady=(2, 2))
     # always-visible version footer (the log scrolls; a maximized window can hide the title)
-    ttk.Label(frm, text=f"version {AGENT_VERSION}", foreground="#888").grid(
-        row=5, column=0, columnspan=3, sticky="e")
+    ttk.Label(bottom, text=f"version {AGENT_VERSION}", foreground="#888").pack(anchor="e")
 
     def logln(s):
         log.configure(state="normal")
@@ -1926,6 +2410,8 @@ def run_gui(cfg, conf_dir):
     cancel = threading.Event()
     comp = {"obj": None}
     ui_state = {"v": "idle"}
+    VM = {}                 # kind ("windows" / "linux") -> that tab's widgets and state
+    TOP = {"cisco": "idle"}  # Cisco button state, for Reload / Reset
 
     def ensure_comp():
         team_id = team_var.get().strip()
@@ -1964,12 +2450,20 @@ def run_gui(cfg, conf_dir):
                          BTN_STATES.get(st, BTN_STATES["idle"])):
             b.configure(state=("normal" if on else "disabled"))
         # lock the competition picker / reset once a competition is under way
+        TOP["cisco"] = st
         try:
             combo.configure(state=("readonly" if st in ("idle", "done") else "disabled"))
-            reload_btn.configure(state=("normal" if (server_served and st in ("idle", "done")) else "disabled"))
-            reset_btn.configure(state=("normal" if st in ("idle", "paused", "done") else "disabled"))
+            topbar_buttons()
         except Exception:
             pass
+
+    def topbar_buttons():
+        """Reload and Reset only while nothing runs in any tab."""
+        vm_busy = any(T["state"] != "idle" for T in VM.values())
+        st = TOP["cisco"]
+        reload_btn.configure(state=("normal" if server_served and st in ("idle", "done") and not vm_busy
+                                    else "disabled"))
+        reset_btn.configure(state=("normal" if st in ("idle", "paused", "done") and not vm_busy else "disabled"))
 
     def run_action(fn, label):
         status_var.set(label)
@@ -2108,6 +2602,222 @@ def run_gui(cfg, conf_dir):
     btn_finish.grid(row=2, column=0, sticky="we", padx=3, pady=2)
     set_buttons("idle")
 
+    # ---- Windows / Linux tabs: practices that run inside the student's practice VM ----
+    here_os, admin_now = host_os(), is_admin()
+
+    def set_text(widget, text):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def vm_tab(kind, title, os_label):
+        f = ttk.Frame(nb, padding=(10, 8, 10, 8))
+        nb.add(f, text=title)
+        T = {"kind": kind, "frame": f, "by_name": {}, "obj": None, "state": "idle",
+             "here": here_os in VM_OS_FOR_KIND[kind]}
+        T["can_start"] = T["here"] and admin_now
+        adm = "administrator" if kind == "windows" else "root"
+        ttk.Label(f, wraplength=640, justify="left", foreground="#2f5e97", text=(
+            f"How to use:   1) Run PT Comp inside your {os_label} practice VM, as {adm}.   2) Pick a "
+            "practice and click Start: PT Comp sets the problems up and shows the README.   3) Fix the "
+            f"problems; your score updates every {VM_INTERVAL} seconds.   4) To redo a practice or load "
+            "another one, restore the VM's Clean snapshot first.")).pack(anchor="w", fill="x")
+        if not T["here"]:
+            ttk.Label(f, foreground="#a15c00", wraplength=640, justify="left", text=(
+                f"This computer isn't running {os_label}. Open this tab in PT Comp inside your {os_label} "
+                "practice VM: a practice changes the settings of the computer it runs on.")).pack(
+                anchor="w", pady=(6, 0))
+        elif not admin_now:
+            warn = tk.Frame(f, background="#fff4d6", padx=8, pady=6)
+            warn.pack(fill="x", pady=(6, 0))
+            ttk.Button(warn, text=f"Restart as {adm}", command=lambda: do_elevate(kind)).pack(side="right")
+            tk.Label(warn, background="#fff4d6", justify="left", wraplength=460, text=(
+                f"Practices change system settings, so PT Comp has to run as {adm} for this tab.")).pack(
+                side="left")
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(8, 2))
+        ttk.Label(bar, text="Practice:").pack(side="left")
+        T["var"] = tk.StringVar()
+        T["combo"] = ttk.Combobox(bar, textvariable=T["var"], state="readonly", width=34)
+        T["combo"].pack(side="left", padx=6)
+        T["start"] = ttk.Button(bar, text="Start", command=lambda: vm_start(T))
+        T["start"].pack(side="left", padx=(6, 3))
+        T["stop"] = ttk.Button(bar, text="Stop", command=lambda: vm_stop(T))
+        T["stop"].pack(side="left")
+        T["levels_var"] = tk.StringVar(value="")
+        ttk.Label(f, textvariable=T["levels_var"], foreground="#555", wraplength=640).pack(anchor="w", pady=(2, 0))
+        T["readme_title"] = tk.StringVar(value="README (shown once you Start)")
+        ttk.Label(f, textvariable=T["readme_title"], font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(6, 0))
+        T["readme"] = scrolledtext.ScrolledText(f, height=7, wrap="word", state="disabled", font=("TkDefaultFont", 9))
+        T["readme"].pack(fill="x")
+        T["score_var"] = tk.StringVar(value="")
+        ttk.Label(f, textvariable=T["score_var"], font=("TkDefaultFont", 10, "bold"),
+                  foreground="#1b7f3b").pack(anchor="w", pady=(6, 0))
+        T["fixed"] = tk.Text(f, height=4, wrap="word", state="disabled", font=("TkDefaultFont", 9),
+                             background="#f4faf5", relief="flat", padx=6, pady=4)
+        T["fixed"].pack(fill="x")
+        T["combo"].bind("<<ComboboxSelected>>", lambda *_: vm_select(T))
+        VM[kind] = T
+        vm_set_state(T, "idle")
+        return T
+
+    def vm_set_state(T, st):
+        T["state"] = st
+        idle = st == "idle"
+        T["start"].configure(state=("normal" if idle and T["can_start"] else "disabled"))
+        T["stop"].configure(state=("normal" if st == "running" else "disabled"))
+        T["combo"].configure(state=("readonly" if idle else "disabled"))
+        topbar_buttons()
+
+    def vm_levels(T):
+        c = T["by_name"].get(T["var"].get())
+        return {int(l["level"]): (l.get("name") or f"Level {l['level']}") for l in (c or {}).get("levels", [])}
+
+    def vm_select(*Ts):
+        for T in Ts:
+            names = vm_levels(T)
+            T["levels_var"].set("   ·   ".join(names[n] for n in sorted(names)))
+            T["readme_title"].set("README (shown once you Start)")
+            set_text(T["readme"], "")
+            T["score_var"].set("")
+            set_text(T["fixed"], "")
+
+    def vm_fill(T, comps):
+        """Fill a VM tab's practice list; the practice set up on this VM is picked first."""
+        T["by_name"] = {}
+        names = []
+        for c in comps:
+            nm = c.get("name") or c.get("comp") or "(unnamed)"
+            base, i = nm, 2
+            while nm in T["by_name"]:
+                nm = f"{base} ({i})"
+                i += 1
+            T["by_name"][nm] = c
+            names.append(nm)
+        T["combo"].configure(values=names)
+        if T["state"] != "idle":
+            return
+        mark = read_marker() if T["here"] else None
+        pick = next((nm for nm, c in T["by_name"].items() if mark and c.get("comp") == mark.get("comp")), None)
+        if not pick and T["var"].get() in T["by_name"]:
+            pick = T["var"].get()
+        T["var"].set(pick or (names[0] if names else ""))
+        vm_select(T)
+        if not names:
+            T["levels_var"].set("No practices here yet. Ask your instructor, then click Reload.")
+
+    def vm_start(T):
+        team_id = team_var.get().strip()
+        if not team_id:
+            status_var.set("Enter your Team ID first.")
+            return
+        c = T["by_name"].get(T["var"].get())
+        if not c or not c.get("levels"):
+            status_var.set("Pick a practice first (click Reload if the list is empty).")
+            return
+        save_state(conf_dir, {"team_id": team_id})
+        kind = T["kind"]
+        T["obj"] = VMPractice(comp_cfg(ENR["shared"], c), team_id, lambda k, p: msgq.put((f"vm:{kind}:{k}", p)),
+                              cancel)
+        vm_set_state(T, "busy")
+        logln(f"Starting {T['var'].get()} as team {team_id}…")
+        status_var.set("Loading the practice…")
+        threading.Thread(target=T["obj"].start, daemon=True).start()
+
+    def vm_stop(T):
+        if T["obj"]:
+            vm_set_state(T, "busy")
+            status_var.set("Stopping…")
+            threading.Thread(target=T["obj"].stop, daemon=True).start()
+
+    def vm_cards(T, payload):
+        names, active = vm_levels(T), payload.get("active")
+        parts = []
+        for ls in payload.get("levels", []):
+            n = ls["level"]
+            mark = ("✓ cleared" if ls.get("cleared") else "▶ now" if n == active
+                    else "open" if ls.get("unlocked") else "🔒 locked")
+            parts.append(f"{names.get(n, f'Level {n}')}: {mark}")
+        T["levels_var"].set("   ·   ".join(parts))
+
+    def vm_results(T, payload):
+        items = payload.get("items", [])
+        got = [i for i in items if i.get("earned")]
+        pts, tot = sum(i["points"] for i in got), sum(i["points"] for i in items)
+        T["score_var"].set(f"Score: {pts} / {tot} points: {len(got)} of {len(items)} problems fixed"
+                           + ("" if payload.get("posted") == 200 else "   (not saved on the scoreboard; retrying)"))
+        set_text(T["fixed"], "\n".join(f"✓ {i['name']}  (+{i['points']})" for i in got)
+                 or "Nothing fixed yet. Read the README, then start fixing!")
+
+    def vm_cleared(T, payload):
+        n, nxt = payload.get("level"), payload.get("next")
+        name = vm_levels(T).get(n, f"Level {n}")
+        how = (f"To start {vm_levels(T).get(nxt, f'level {nxt}')}: restore your VM's Clean snapshot, start the "
+               "VM, open PT Comp, and click Start." if nxt else "That was the last level of this practice.")
+        status_var.set(f"{name} cleared! " + how)
+        logln(f"{name} cleared!" + (f" Message: {payload['text']}" if payload.get("text") else ""))
+        if payload.get("popup"):
+            msg = f"{name} cleared!\n\n" + (payload["text"] + "\n\n" if payload.get("text") else "") + how
+            try:
+                messagebox.showinfo("Practice cleared", msg)
+            except Exception:
+                pass
+
+    def vm_message(kind, sub, payload):
+        T = VM.get(kind)
+        if not T:
+            return
+        if sub == "log":
+            logln(payload)
+        elif sub == "status":
+            status_var.set(payload)
+        elif sub == "error":
+            try:
+                messagebox.showerror("Practice", payload)
+            except Exception:
+                pass
+        elif sub == "state":
+            vm_set_state(T, payload)
+        elif sub == "cards":
+            vm_cards(T, payload)
+        elif sub == "readme":
+            T["readme_title"].set("README: " + payload.get("title", ""))
+            set_text(T["readme"], payload.get("text", ""))
+        elif sub == "results":
+            vm_results(T, payload)
+        elif sub == "cleared":
+            vm_cleared(T, payload)
+
+    def do_elevate(kind):
+        if not cfg_path:
+            status_var.set("Can't restart: the config file's location is unknown.")
+            return
+        proc, err = relaunch_elevated(cfg_path, kind)
+        if err:
+            messagebox.showerror("Restart", err)
+            return
+        if proc is None:  # Windows: the administrator copy is starting
+            on_close()
+            return
+        root.withdraw()   # Linux: hidden until the root copy ends (or its password prompt is cancelled)
+
+        def watch():
+            rc = proc.poll()
+            if rc is None:
+                root.after(500, watch)
+            elif rc == 0:
+                on_close()
+            else:
+                root.deiconify()
+                messagebox.showerror("Restart", "PT Comp wasn't started as root (the password prompt was "
+                                     "cancelled or failed)." if rc in (126, 127)
+                                     else f"The root copy of PT Comp stopped (exit code {rc}).")
+        root.after(500, watch)
+
+    vm_tab("windows", "Windows 11 / Server", "Windows")
+    vm_tab("linux", "Linux / FreeBSD", "Linux")
+
     def select_comp(*_):
         comp["obj"] = None   # a different competition needs a fresh Competition object
         c = ENR["by_name"].get(sel_var.get())
@@ -2138,6 +2848,12 @@ def run_gui(cfg, conf_dir):
         status_var.set(f"Selected “{nm}”. Enter your Team ID and click Start.")
 
     def apply_enrollment(shared, comps, default_comp):
+        by_kind = {}
+        for c in comps:
+            by_kind.setdefault(c.get("kind") or "cisco", []).append(c)
+        for kind, T in VM.items():
+            vm_fill(T, by_kind.get(kind, []))
+        everything, comps = comps, by_kind.get("cisco", [])
         ENR["shared"], ENR["comps"], ENR["by_name"] = shared, comps, {}
         names = []
         for c in comps:
@@ -2157,8 +2873,11 @@ def run_gui(cfg, conf_dir):
             select_comp()
         else:
             rebuild_cards([])
+        if not everything:
             status_var.set("No competitions available yet. Ask your instructor, then click Reload.")
-        logln(f"Loaded {len(comps)} competition(s)." + (f"  Default: {default_comp}." if default_comp else ""))
+        counts = ", ".join(f"{len(v)} {k}" for k, v in sorted(by_kind.items()))
+        logln(f"Loaded {len(everything)} competition(s)/practice(s)" + (f" ({counts})." if counts else ".")
+              + (f"  Default: {default_comp}." if default_comp else ""))
 
     def load_enrollment():
         if not server_served:
@@ -2185,7 +2904,10 @@ def run_gui(cfg, conf_dir):
         try:
             while True:
                 kind, payload = msgq.get_nowait()
-                if kind == "log":
+                if kind.startswith("vm:"):
+                    _vm, vkind, sub = kind.split(":", 2)
+                    vm_message(vkind, sub, payload)
+                elif kind == "log":
                     logln(payload)
                 elif kind == "status":
                     status_var.set(payload)
@@ -2216,6 +2938,10 @@ def run_gui(cfg, conf_dir):
         root.after(250, poll)
 
     logln(f"Ready. Agent v{AGENT_VERSION}. Server: {cfg.get('levelsvc', '?')}")
+    # open on the requested tab (an administrator copy), or on the VM tab whose practice is set up here
+    want = tab if tab in VM else next((k for k, T in VM.items() if T["here"] and read_marker()), None)
+    if want:
+        nb.select(VM[want]["frame"])
     root.after(250, poll)
     if not os.environ.get("PT_AGENT_SELFTEST"):
         load_enrollment()
@@ -2232,7 +2958,22 @@ def run_gui(cfg, conf_dir):
     if os.environ.get("PT_AGENT_SELFTEST"):
         demo = [{"level": 1, "image": "x", "threshold": 100}, {"level": 2, "image": "y", "threshold": 100}]
         apply_enrollment(dict(cfg), [{"comp": "demo", "name": "Demo competition", "levels": demo},
-                                     {"comp": "demo2", "name": "Practice competition", "practice": True, "levels": demo}], "demo")
+                                     {"comp": "demo2", "name": "Practice competition", "practice": True, "levels": demo},
+                                     {"comp": "win1", "name": "Windows Basics 1", "kind": "windows", "practice": True,
+                                      "levels": [{"level": 1, "name": "Users, firewall, policy", "image": "w"}]},
+                                     {"comp": "lin1", "name": "Linux Basics 1", "kind": "linux", "practice": True,
+                                      "levels": [{"level": 1, "name": "Users, firewall, files", "image": "l"}]}],
+                         "demo")
+        if os.environ.get("PT_AGENT_SELFTEST_TAB") in VM:   # a VM tab mid-practice, for screenshots
+            T = VM[os.environ["PT_AGENT_SELFTEST_TAB"]]
+            nb.select(T["frame"])
+            vm_message(T["kind"], "readme", {"title": "Linux Basics 1: Users, firewall, files",
+                                              "text": "Authorized administrators: you.\nAuthorized users: alice, bob."})
+            vm_message(T["kind"], "cards", {"levels": [{"level": 1, "unlocked": True}], "active": 1})
+            vm_message(T["kind"], "results", {"posted": 200, "items": [
+                {"name": "Removed unauthorized user hacker", "points": 20, "earned": True},
+                {"name": "Firewall is on", "points": 20, "earned": True},
+                {"name": "x", "points": 20, "earned": False}]})
         if os.environ.get("PT_AGENT_SELFTEST_PRACTICE"):
             sel_var.set("Practice competition")   # exercise the practice controls path
             select_comp()
@@ -2271,6 +3012,18 @@ def run_cli(cfg, conf_dir, team_id, once, comp_id=None):
     print(f"[comp] {chosen.get('name') or chosen.get('comp')}  ({len(chosen.get('levels', []))} level(s))")
     ccfg = comp_cfg(shared, chosen)
     cancel = threading.Event()
+    if ccfg["kind"] in VM_OS_FOR_KIND:   # a Windows/Linux practice, on this (practice) machine
+        prac = VMPractice(ccfg, team_id, lambda k, p: print(f"[{k}] {p}"), cancel)
+        prac.start()
+        try:
+            if once:
+                time.sleep(5)
+            while not once and prac.loop_thread and prac.loop_thread.is_alive():
+                prac.loop_thread.join(0.5)
+        except KeyboardInterrupt:
+            pass
+        prac.stop()
+        return
     comp = Competition(ccfg, team_id, lambda k, p: print(f"[{k}] {p}"), cancel)
     comp.start(fresh=False)
     if once:
@@ -2509,6 +3262,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="one cycle then exit (implies --cli)")
     ap.add_argument("--team", help="team id (CLI)")
     ap.add_argument("--comp", help="competition id to run (CLI; defaults to the server default)")
+    ap.add_argument("--tab", choices=("cisco", "windows", "linux"), help="open on this tab")
+    ap.add_argument("--no-update", action="store_true", help="skip the update check (administrator copy)")
     args = ap.parse_args()
     cfg_path = resolve_config(args.config)
     cfg = load_cfg(cfg_path)
@@ -2522,10 +3277,11 @@ def main():
     else:
         # self-update before the main window opens; if it updates, the new copy has already been
         # started, so just exit
-        _cleanup_after_update()
-        if _update_with_splash(cfg):
-            return
-        run_gui(cfg, conf_dir)
+        if not args.no_update:
+            _cleanup_after_update()
+            if _update_with_splash(cfg):
+                return
+        run_gui(cfg, conf_dir, cfg_path, args.tab)
 
 
 if __name__ == "__main__":

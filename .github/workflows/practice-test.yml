@@ -1,0 +1,54 @@
+name: Test practices (Windows + Linux)
+
+# Runs every Windows/Linux practice for real on throwaway runners: setup -> nothing scores,
+# the test fixes -> everything scores, setup again -> nothing scores. Run it from the Actions tab,
+# or it runs on pushes that change practices/ or the agent.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['practices/**', 'pt_agent.py', '.github/workflows/practice-test.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04   # same base as Linux Mint 21
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-cryptography ufw
+      - name: Run each Linux practice
+        run: |
+          for s in practices/*.json; do
+            grep -q '"os": "linux"' "$s" || continue
+            name=$(basename "$s" .json)
+            echo "::group::$name"
+            sudo python3 practices/tests/run_scenario.py "$s" "practices/tests/$name.fix.sh"
+            echo "::endgroup::"
+          done
+
+  windows:
+    runs-on: windows-latest   # Windows Server; also covers the Server side of the Windows tab
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: python -m pip install cryptography
+      - name: Run each Windows practice
+        shell: pwsh
+        run: |
+          foreach ($s in Get-ChildItem practices\*.json) {
+            if (-not (Select-String -Path $s -Pattern '"os": "windows"' -Quiet)) { continue }
+            Write-Host "::group::$($s.BaseName)"
+            python practices\tests\run_scenario.py $s.FullName "practices\tests\$($s.BaseName).fix.ps1"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Write-Host "::endgroup::"
+          }
