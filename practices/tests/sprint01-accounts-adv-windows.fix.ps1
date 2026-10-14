@@ -28,9 +28,3 @@ Remove-LocalGroupMember -SID 'S-1-5-32-580' -Member 'wsmanguest' -ErrorAction Si
 Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
 try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null } catch { }
 Start-Service -Name WinRM -ErrorAction SilentlyContinue
-
-# ===== TEMP DIAG (remove) =====
-Write-Host "=== DIAG WinRM svc ==="; Get-Service WinRM | Format-List Name,Status,StartType | Out-String | Write-Host
-Write-Host "=== DIAG Test-WSMan ==="; try { Test-WSMan -ComputerName localhost -ErrorAction Stop | Out-String | Write-Host } catch { Write-Host "WSMan ERR: $($_.Exception.Message)" }
-Write-Host "=== DIAG listeners ==="; try { Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop | Out-String | Write-Host } catch { Write-Host "listener ERR: $($_.Exception.Message)" }
-Write-Host "=== DIAG Invoke ==="; try { $r = Invoke-Command -ComputerName localhost -ScriptBlock { 'PTWINRM-OK' } -ErrorAction Stop; Write-Host "RESULT=[$r]" } catch { Write-Host "Invoke ERR: $($_.Exception.Message)" }

@@ -131,7 +131,7 @@
         },
         {
           "type": "Command",
-          "cmd": "try { $r = Invoke-Command -ComputerName localhost -ScriptBlock { 'PTWINRM-OK' } -ErrorAction Stop; if (\"$r\" -eq 'PTWINRM-OK') { exit 0 } else { exit 1 } } catch { exit 1 }"
+          "cmd": "try { Test-WSMan -ComputerName localhost -ErrorAction Stop | Out-Null; exit 0 } catch { exit 1 }"
         }
       ]
     },
