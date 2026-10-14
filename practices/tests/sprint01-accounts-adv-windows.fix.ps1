@@ -21,3 +21,10 @@ ClearTextPassword = 0
 signature="`$CHICAGO`$"
 "@ | Set-Content -Path $inf -Encoding Unicode
 secedit /configure /db (Join-Path $env:TEMP 'spfix.sdb') /cfg $inf /areas SECURITYPOLICY /quiet
+
+# Remote-management service: least-privilege the account, drop unauthorized remote access, bring WinRM up
+Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'svc_wsman' -ErrorAction SilentlyContinue
+Remove-LocalGroupMember -SID 'S-1-5-32-580' -Member 'wsmanguest' -ErrorAction SilentlyContinue
+Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
+try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null } catch { }
+Start-Service -Name WinRM -ErrorAction SilentlyContinue

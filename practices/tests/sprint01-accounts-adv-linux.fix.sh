@@ -9,3 +9,8 @@ gpasswd -d bob shadow >/dev/null
 groupdel pirates
 usermod -s /usr/sbin/nologin www-data
 chage -d 0 dave
+
+# Remote-login service: harden SSH and bring the required service up
+install -d -m 755 /etc/ssh/sshd_config.d
+printf 'PermitRootLogin no\nPermitEmptyPasswords no\n' > /etc/ssh/sshd_config.d/99-ptcomp.conf
+systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd
