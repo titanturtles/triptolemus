@@ -1,0 +1,43 @@
+{
+  "format": 1,
+  "os": "linux",
+  "title": "Self-test: forensics answers",
+  "readme": "Internal CI self-test for the forensics answer-scoring primitive (never deployed to students). Two questions are answered via hashed answers; one ordinary check proves forensics coexist with a normal fix.",
+  "setup": "\nset -e\nid xtest >/dev/null 2>&1 || useradd -M xtest\n",
+  "checks": [
+    {
+      "message": "Removed the unauthorized user xtest",
+      "points": 20,
+      "pass": [
+        {
+          "type": "UserExistsNot",
+          "user": "xtest"
+        }
+      ]
+    },
+    {
+      "message": "FQ1: the username that kept a hidden diary",
+      "points": 20,
+      "pass": [
+        {
+          "type": "AnswerHash",
+          "id": "fq1",
+          "salt": "c5d09d383b5114f6",
+          "sha256": "0c716b1115c77dd41d3ba16779eb59a4c965e3b97f74ed3df56bf5b1b7dada85"
+        }
+      ]
+    },
+    {
+      "message": "FQ2: the source IP the attacker brute-forced SSH from",
+      "points": 20,
+      "pass": [
+        {
+          "type": "AnswerHash",
+          "id": "fq2",
+          "salt": "4dd8246603d52a7f",
+          "sha256": "71060f5d935b279d36104348ff43aa227cf04b1a93a63063aed097551afed90e"
+        }
+      ]
+    }
+  ]
+}

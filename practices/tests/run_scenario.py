@@ -15,9 +15,10 @@ A = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(A)
 
 
-def score(scen):
-    """-> (each problem's state, each penalty's state)"""
-    items = A.ScenarioChecks().score(scen["checks"])
+def score(scen, answers=None):
+    """-> (each problem's state, each penalty's state). `answers` stands in for the forensics
+    answers a student would type; pass them only when simulating a fully-worked machine."""
+    items = A.ScenarioChecks(answers).score(scen["checks"])
     for i in items:
         print(f"  [{'x' if i['earned'] else ' '}] {i['name']} ({i['points']})")
     return ([i["earned"] for i in items if i["points"] >= 0], [i["earned"] for i in items if i["points"] < 0])
@@ -44,13 +45,18 @@ def main():
     scen = json.load(open(path, encoding="utf-8"))
     if scen["os"] != A.host_os():
         sys.exit(f"{path} is for {scen['os']}, this is {A.host_os()}")
+    # Forensics answers a worked machine would have typed (see AnswerHash checks). Fed only on the
+    # fixed/penalty passes, never at setup, so "nothing scores at setup" still holds.
+    import re as _re
+    answers_path = _re.sub(r"\.fix\.(sh|ps1)$", ".answers.json", fix)
+    answers = json.load(open(answers_path, encoding="utf-8")) if os.path.exists(answers_path) else {}
     bad = []
     print("== setup"); setup(scen)
-    fixed, pens = score(scen)
+    fixed, pens = score(scen)                         # no answers: forensics must not score here
     if any(fixed) or any(pens):
         bad.append("something already counts right after setup")
     print("== fixes"); run(fix)
-    fixed, pens = score(scen)
+    fixed, pens = score(scen, answers)                # fixes applied + forensics answered
     if not all(fixed):
         bad.append("not every problem scores after the fixes")
     if any(pens):
@@ -58,12 +64,12 @@ def main():
     penalty = fix.replace(".fix.", ".penalty.")
     if pens and os.path.exists(penalty):
         print("== penalties"); run(penalty)
-        if not all(score(scen)[1]):
+        if not all(score(scen, answers)[1]):
             bad.append("not every penalty fires")
     elif pens:
         print(f"(no {os.path.basename(penalty)}: penalties not exercised)")
     print("== setup again (on the fixed machine)"); setup(scen)
-    fixed, pens = score(scen)
+    fixed, pens = score(scen)                         # no answers again
     if any(fixed) or any(pens):
         bad.append("setup didn't put every problem back")
     if bad:

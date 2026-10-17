@@ -1204,9 +1204,11 @@ def read_security_policy():
 class ScenarioChecks:
     """Evaluates a scenario's checks on this machine. Use one per scoring run, so slow reads
     (the Windows security policy) happen once per run."""
-    def __init__(self):
+    def __init__(self, answers=None):
         self.win = sys.platform.startswith("win")
         self._secpol = None
+        # forensics answers the student has typed: {question id -> answer text}
+        self.answers = answers or {}
 
     def score(self, checks):
         """-> [{"name", "points", "earned"}] in the scenario's order."""
@@ -1343,6 +1345,18 @@ class ScenarioChecks:
             return ("min" not in c or n >= int(c["min"])) and ("max" not in c or n <= int(c["max"]))
         return v.strip().lower() == str(c["value"]).strip().lower()
 
+    def _AnswerHash(self, c, regex):
+        """A forensics question. The scenario ships the expected answer only as a salted SHA-256,
+        so the student can't read it off the scenario; this compares a hash of what they typed.
+        {"id": "fq1", "salt": "...", "sha256": "<hex>", "normalize": "lower"|"none"}."""
+        ans = self.answers.get(c.get("id") or c.get("message") or "")
+        if not ans:
+            return False
+        norm = str(ans).strip()
+        if c.get("normalize", "lower") != "none":
+            norm = norm.lower()
+        return hashlib.sha256((str(c.get("salt", "")) + norm).encode("utf-8")).hexdigest() == c.get("sha256", "")
+
 
 class VMPractice:
     """Drives one Windows/Linux practice inside the student's practice VM: sets the level's
@@ -1444,12 +1458,22 @@ class VMPractice:
                                 f"\n\nHow to restore: {RESTORE_SNAPSHOT}")
         self.report("log", "Setup done. Every problem is in place. Go!")
 
+    def _answers(self):
+        """The student's saved forensics answers for this competition, {question id -> text}."""
+        cd = self.cfg.get("conf_dir")
+        if not cd:
+            return {}
+        try:
+            return (load_state(cd).get("answers") or {}).get(self.comp, {})
+        except Exception:
+            return {}
+
     def _loop(self):
         lc = self.level_cfg(self.current)
         checks = self.scenario.get("checks", [])
         while not self.loop_stop.is_set() and not self.cancel.is_set():
             try:
-                items = ScenarioChecks().score(checks)
+                items = ScenarioChecks(self._answers()).score(checks)
             except Exception as e:
                 self.report("log", f"Scoring error: {e}")
                 items = None
@@ -3043,8 +3067,8 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
                 logln("Take the Clean snapshot now, then click Start.")
                 return
         kind = T["kind"]
-        T["obj"] = VMPractice(comp_cfg(ENR["shared"], c), team_id, lambda k, p: msgq.put((f"vm:{kind}:{k}", p)),
-                              cancel)
+        T["obj"] = VMPractice(dict(comp_cfg(ENR["shared"], c), conf_dir=conf_dir), team_id,
+                              lambda k, p: msgq.put((f"vm:{kind}:{k}", p)), cancel)
         vm_set_state(T, "busy")
         logln(f"Starting {T['var'].get()} as team {team_id}…")
         status_var.set("Loading the practice…")
@@ -3380,6 +3404,7 @@ def run_cli(cfg, conf_dir, team_id, once, comp_id=None):
     chosen = next((c for c in comps if c.get("comp") == want), comps[0])
     print(f"[comp] {chosen.get('name') or chosen.get('comp')}  ({len(chosen.get('levels', []))} level(s))")
     ccfg = comp_cfg(shared, chosen)
+    ccfg["conf_dir"] = conf_dir
     cancel = threading.Event()
     if ccfg["kind"] in VM_OS_FOR_KIND:   # a Windows/Linux practice, on this (practice) machine
         prac = VMPractice(ccfg, team_id, lambda k, p: print(f"[{k}] {p}"), cancel)
