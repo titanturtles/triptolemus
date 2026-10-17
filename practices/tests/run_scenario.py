@@ -32,9 +32,15 @@ def setup(scen):
 
 
 def run(script):
-    argv = (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] if A.host_os() == "windows"
-            else ["bash", script])
-    if subprocess.run(argv).returncode != 0:
+    env = None
+    if A.host_os() == "windows":
+        argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]
+        # CI runs under PowerShell 7; without this, Windows PowerShell inherits PS7's module path and
+        # can't load its own modules (ConvertTo-SecureString etc.) — the same strip the agent does.
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    else:
+        argv = ["bash", script]
+    if subprocess.run(argv, env=env).returncode != 0:
         sys.exit(f"{script} failed")
 
 
