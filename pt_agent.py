@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.3"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.4"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1418,6 +1418,10 @@ class VMPractice:
                 write_marker(dict(info, state="ready"))
             self.current, self.scenario = lvl, scen
             self.report("readme", {"title": title, "text": scen.get("readme", "")})
+            qs = [{"id": c0["id"], "q": ch.get("message", "")}
+                  for ch in scen.get("checks", []) for c0 in (ch.get("pass") or [])
+                  if c0.get("type") == "AnswerHash" and c0.get("id")]
+            self.report("questions", {"comp": self.comp, "items": qs})
         except PracticeError as e:
             return self._fail(str(e))
         except urllib.error.HTTPError as e:
@@ -2865,6 +2869,10 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["start"].pack(side="left", padx=(6, 3))
         T["stop"] = ttk.Button(bar, text="Stop", command=lambda: vm_stop(T))
         T["stop"].pack(side="left")
+        # forensics answer entry: shown only once a started practice reports it has questions
+        T["questions"] = []
+        T["qcomp"] = ""
+        T["forensics_btn"] = ttk.Button(bar, text="Forensics…", command=lambda: vm_questions(T))
         ttk.Checkbutton(bar, text="Sound", variable=sound_var,
                         command=lambda: save_state(conf_dir, {"sound": sound_var.get()})).pack(side="right")
         T["levels_var"] = tk.StringVar(value="")
@@ -3013,6 +3021,8 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_readme(T, "README (shown once you Start)", "")
             T["score_var"].set("")
             set_text(T["fixed"], "")
+            T["questions"] = []
+            T["forensics_btn"].pack_forget()
             vm_note(T)
 
     def vm_fill(T, comps):
@@ -3112,6 +3122,61 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             box.insert("end", "Nothing fixed yet. Read the README, then start fixing!")
         box.configure(state="disabled")
 
+    def vm_show_questions(T, payload):
+        """A started practice told us its forensics questions: reveal the Forensics button for it."""
+        T["questions"] = payload.get("items", []) or []
+        T["qcomp"] = payload.get("comp", "")
+        btn = T["forensics_btn"]
+        if T["questions"] and not btn.winfo_manager():
+            btn.pack(side="left", padx=(6, 0))
+        elif not T["questions"]:
+            btn.pack_forget()
+
+    def vm_questions(T):
+        """Dialog to type/answer this practice's forensics questions; saved into state for scoring."""
+        qs = T.get("questions") or []
+        if not qs:
+            return
+        comp = T.get("qcomp", "")
+        saved = dict((load_state(conf_dir).get("answers") or {}).get(comp, {}))
+        win = tk.Toplevel(root)
+        win.title("Forensics questions")
+        win.transient(root)
+        ttk.Label(win, text="Answer the forensics questions", font=("TkDefaultFont", 11, "bold"),
+                  padding=(16, 14, 16, 2)).pack(anchor="w")
+        ttk.Label(win, text=("Your answers are checked while you work — the score updates within a few "
+                             "seconds of saving. Answers are not case-sensitive."), wraplength=520,
+                  justify="left", foreground="#555", padding=(16, 0, 16, 8)).pack(anchor="w")
+        body = ttk.Frame(win, padding=(16, 0, 16, 4))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        entries = {}
+        for i, q in enumerate(qs):
+            ttk.Label(body, text=q.get("q") or q.get("id"), wraplength=500, justify="left").grid(
+                row=i * 2, column=0, sticky="w", pady=(6, 0))
+            var = tk.StringVar(value=saved.get(q["id"], ""))
+            ttk.Entry(body, textvariable=var, width=54).grid(row=i * 2 + 1, column=0, sticky="we", pady=(1, 0))
+            entries[q["id"]] = var
+
+        def save():
+            a = load_state(conf_dir).get("answers") or {}
+            a[comp] = dict(a.get(comp, {}), **{qid: v.get().strip() for qid, v in entries.items()})
+            save_state(conf_dir, {"answers": a})
+            logln("Saved forensics answers; the score will update on the next check.")
+            win.destroy()
+        bb = ttk.Frame(win, padding=(12, 2, 12, 14))
+        bb.pack(fill="x")
+        ttk.Button(bb, text="Save answers", command=save).pack(side="left", padx=4)
+        ttk.Button(bb, text="Cancel", command=win.destroy).pack(side="left", padx=4)
+        win.update_idletasks()
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - win.winfo_reqwidth()) // 2)
+        win.geometry(f"+{max(0, x)}+{max(0, root.winfo_rooty() + 80)}")
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
     def vm_change(T, payload):
         """Points gained or lost since the last scoring run: log it and play the matching sound."""
         for g in payload.get("gained", []):
@@ -3158,6 +3223,8 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_readme(T, "README: " + payload.get("title", ""), payload.get("text", ""))
         elif sub == "results":
             vm_results(T, payload)
+        elif sub == "questions":
+            vm_show_questions(T, payload)
         elif sub == "change":
             vm_change(T, payload)
         elif sub == "cleared":
@@ -3367,6 +3434,11 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
                 {"name": "Firewall is on", "points": 20, "earned": True},
                 {"name": "x", "points": 20, "earned": False},
                 {"name": "Removed authorized user alice", "points": -10, "earned": True}]})
+            if os.environ.get("PT_AGENT_SELFTEST_QUESTIONS"):   # the forensics answer panel
+                vm_message(T["kind"], "questions", {"comp": "demoq", "items": [
+                    {"id": "fq1", "q": "FQ1: the username that kept a hidden diary"},
+                    {"id": "fq2", "q": "FQ2: the source IP the attacker brute-forced SSH from"}]})
+                root.after(900, lambda: vm_questions(T))
         if os.environ.get("PT_AGENT_SELFTEST_PRACTICE"):
             sel_var.set("Practice competition")   # exercise the practice controls path
             select_comp()
