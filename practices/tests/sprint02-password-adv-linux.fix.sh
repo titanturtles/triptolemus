@@ -3,7 +3,11 @@
 set -e
 for u in rowan mmouse; do userdel -rf "$u" 2>/dev/null || userdel -f "$u"; done
 gpasswd -d vkinbott sudo >/dev/null 2>&1 || true
-userdel -f lgates 2>/dev/null || true
+userdel -rf lgates 2>/dev/null || userdel -f lgates 2>/dev/null || true
+if awk -F: '$3==0 && $1!="root"' /etc/passwd | grep -q lgates; then
+  sed -i '/^lgates:/d' /etc/passwd
+  sed -i '/^lgates:/d' /etc/shadow 2>/dev/null || true
+fi
 # account policy
 sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' /etc/login.defs
 cat > /etc/security/pwquality.conf <<PWQ
