@@ -1,4 +1,4 @@
-# Sets off every penalty of sprint01-accounts-adv-windows (CI tests only; never uploaded).
+# Fires every penalty of sprint01-accounts-adv-windows (CI only; never uploaded).
 $ErrorActionPreference = 'Stop'
-Remove-LocalUser -Name 'alice'
-Remove-LocalUser -Name 'frank'
+Remove-Item -Path 'C:\Program Files\Mozilla Firefox' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path 'C:\Program Files\GIMP 2' -Recurse -Force -ErrorAction SilentlyContinue

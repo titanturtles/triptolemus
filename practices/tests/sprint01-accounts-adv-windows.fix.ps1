@@ -1,26 +1,25 @@
-# Fixes for sprint01-accounts-adv-windows (CI tests only; never uploaded to students).
+# Fixes for sprint01-accounts-adv-windows (CI only; never uploaded to students).
 $ErrorActionPreference = 'Stop'
-Remove-LocalUser -Name 'mallory'
-net user "sysadmin$" /delete | Out-Null
-Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'bob'
-Remove-LocalGroupMember -SID 'S-1-5-32-551' -Member 'carol'
-Remove-LocalGroupMember -SID 'S-1-5-32-555' -Member 'dave'
-Get-LocalUser | Where-Object { $_.SID.Value -like '*-501' } | Disable-LocalUser
-Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' } | Disable-LocalUser
-$w = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-Set-ItemProperty -Path $w -Name AutoAdminLogon -Value '0'
-Remove-ItemProperty -Path $w -Name DefaultPassword -ErrorAction SilentlyContinue
-Set-LocalUser -Name 'bob' -PasswordNeverExpires $false
-$inf = Join-Path $env:TEMP 'sp_fix.inf'
-@"
-[Unicode]
-Unicode=yes
-[System Access]
-ClearTextPassword = 0
-[Version]
-signature="`$CHICAGO`$"
-"@ | Set-Content -Path $inf -Encoding Unicode
-secedit /configure /db (Join-Path $env:TEMP 'spfix.sdb') /cfg $inf /areas SECURITYPOLICY /quiet
+Remove-LocalUser -Name 'pmckinney' -ErrorAction SilentlyContinue
+Remove-LocalUser -Name 'yismaylov' -ErrorAction SilentlyContinue
+Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'jbyers'  -ErrorAction SilentlyContinue
+Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'mbauman' -ErrorAction SilentlyContinue
+if (-not (Get-LocalUser -Name esinclair -ErrorAction SilentlyContinue)) {
+    New-LocalUser -Name esinclair -Password (ConvertTo-SecureString 'Str0ng!Pass#99x' -AsPlainText -Force) -PasswordNeverExpires | Out-Null
+}
+if (-not (Get-LocalGroup -Name dragonfire -ErrorAction SilentlyContinue)) { New-LocalGroup -Name dragonfire | Out-Null }
+foreach ($u in 'emunson','gareth','jeff','mwheeler','dhenderson','lsinclair','esinclair') { Add-LocalGroupMember -Group dragonfire -Member $u -ErrorAction SilentlyContinue }
+cmd /c 'net accounts /maxpwage:90' | Out-Null
+cmd /c 'net accounts /lockoutthreshold:10 /lockoutduration:30 /lockoutwindow:30' | Out-Null
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LimitBlankPasswordUse' -Type DWord -Value 1
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RestrictAnonymousSAM'  -Type DWord -Value 1
+Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Type DWord -Value 0
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoUpdate' -Type DWord -Value 0
+foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
+    Remove-Item -Path (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # Remote-management service: least-privilege the account, drop unauthorized remote access, bring WinRM up
 Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'svc_wsman' -ErrorAction SilentlyContinue
@@ -28,7 +27,6 @@ Remove-LocalGroupMember -SID 'S-1-5-32-580' -Member 'wsmanguest' -ErrorAction Si
 Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
 try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null } catch { }
 Start-Service -Name WinRM -ErrorAction SilentlyContinue
-
 # CompanyData share: bring the Server service back and remove the Everyone grant
 Set-Service -Name LanmanServer -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service -Name LanmanServer -ErrorAction SilentlyContinue
