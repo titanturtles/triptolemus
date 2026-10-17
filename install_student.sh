@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # install_student.sh - one-step Linux student setup (mirror of install_student.ps1).
 # Run it from the folder containing pt_agent (or pt_agent.py). It will:
-#   1. Ensure the pt_agent binary (use ./pt_agent, copy ./dist/pt_agent, or build pt_agent.py).
+#   1. Ensure the pt_agent binary: use ./pt_agent, copy ./dist/pt_agent, build ./pt_agent.py if
+#      the source is here, or else DOWNLOAD the current published build from the scoreboard.
 #   2. Write pt_agent.conf.json with the server URL + class token baked in (students only
 #      enter a Team ID; the token is never typed).
 #   3. Create a desktop launcher + autostart entry (app opens at login).
 #
+# This script is self-contained: on a fresh box with no repo and no build tools, just copy this
+# one file over and run it — it downloads pt_agent from the scoreboard using the token below.
+#
 # Usage:
-#   ./install_student.sh                              install (build if needed)
+#   ./install_student.sh                              install (download if no local/source build)
+#   ./install_student.sh --download                   force-fetch the published build from the server
 #   LEVELSVC=https://.../levels CLASS_TOKEN=xxx ./install_student.sh   override server
 #   ./install_student.sh --remove                     remove launcher + autostart
 #
@@ -32,11 +37,40 @@ if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "-r" ]; then
 fi
 
 # --force / -f : rebuild the binary from source even if one exists
-if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
-  rm -f "$EXE" "$HERE/dist/pt_agent"
+# --download / -d : fetch the current published binary from the scoreboard even if one exists
+FORCE_DL=0
+case "${1:-}" in
+  --force|-f)    rm -f "$EXE" "$HERE/dist/pt_agent" ;;
+  --download|-d) rm -f "$EXE" "$HERE/dist/pt_agent"; FORCE_DL=1 ;;
+esac
+
+# Fetch the current published pt_agent straight from the scoreboard. No repo, no GitHub, no
+# build tools needed — only a network path to the scoreboard and the class token baked in above
+# (the same token every student install uses). Sets $EXE on success.
+download_binary() {
+  local url="$LEVELSVC/agent/file?platform=linux" tmp="$EXE.dl"
+  if command -v curl >/dev/null 2>&1; then
+    echo "[*] downloading pt_agent from $LEVELSVC ..."
+    curl -fsSL -H "X-Class-Token: $CLASS_TOKEN" "$url" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    echo "[*] downloading pt_agent from $LEVELSVC ..."
+    wget -q --header="X-Class-Token: $CLASS_TOKEN" -O "$tmp" "$url" || { rm -f "$tmp"; return 1; }
+  else
+    return 1
+  fi
+  if [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -lt 102400 ]; then   # a real build is tens of MB
+    rm -f "$tmp"; echo "[!] download failed or returned an error page"; return 1
+  fi
+  mv "$tmp" "$EXE"; chmod +x "$EXE"
+  echo "[+] downloaded pt_agent $("$EXE" --version 2>/dev/null | awk '{print $NF}')"
+}
+
+# --download forces the scoreboard build in regardless of what's here locally
+if [ "$FORCE_DL" = 1 ]; then
+  download_binary || { echo "ERROR: --download failed (no network to $LEVELSVC, or no curl/wget)"; exit 1; }
 fi
 
-# 1) ensure the binary
+# 1) ensure the binary: a local one, else a source build (repo present), else the scoreboard
 if [ ! -x "$EXE" ]; then
   if [ -x "$HERE/dist/pt_agent" ]; then
     cp "$HERE/dist/pt_agent" "$EXE"; echo "[*] used dist/pt_agent"
@@ -76,8 +110,12 @@ if [ ! -x "$EXE" ]; then
       --distpath "$HERE/dist" --workpath "$HERE/build" --specpath "$HERE" "$HERE/pt_agent.py"
     cp "$HERE/dist/pt_agent" "$EXE"
     echo "[+] built pt_agent version ${VER:-?}  (publish this version on the console's App update page)"
+  elif download_binary; then
+    :   # bare box: pulled the published build from the scoreboard
   else
-    echo "ERROR: need pt_agent, dist/pt_agent, or pt_agent.py in $HERE"; exit 1
+    echo "ERROR: no pt_agent/dist/pt_agent/pt_agent.py here, and could not download one."
+    echo "       Give me a network path to $LEVELSVC (curl/wget), or drop a prebuilt 'pt_agent' here."
+    exit 1
   fi
 fi
 chmod +x "$EXE"
