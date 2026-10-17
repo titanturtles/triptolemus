@@ -14,3 +14,18 @@ chage -d 0 dave
 install -d -m 755 /etc/ssh/sshd_config.d
 printf 'PermitRootLogin no\nPermitEmptyPasswords no\n' > /etc/ssh/sshd_config.d/99-ptcomp.conf
 systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd
+
+# Internal web service: bind it to localhost and bring it up
+cat > /etc/systemd/system/ptweb.service <<'UNIT'
+[Unit]
+Description=PT Comp internal status web service
+After=network.target
+[Service]
+User=ptweb
+ExecStart=/usr/bin/python3 -m http.server 8099 --bind 127.0.0.1 --directory /srv/ptweb
+Restart=no
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now ptweb

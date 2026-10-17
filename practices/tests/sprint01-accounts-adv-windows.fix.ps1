@@ -28,3 +28,9 @@ Remove-LocalGroupMember -SID 'S-1-5-32-580' -Member 'wsmanguest' -ErrorAction Si
 Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
 try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null } catch { }
 Start-Service -Name WinRM -ErrorAction SilentlyContinue
+
+# CompanyData share: bring the Server service back and remove the Everyone grant
+Set-Service -Name LanmanServer -StartupType Automatic -ErrorAction SilentlyContinue
+Start-Service -Name LanmanServer -ErrorAction SilentlyContinue
+Revoke-SmbShareAccess -Name 'CompanyData' -AccountName 'Everyone' -Force -ErrorAction SilentlyContinue | Out-Null
+Grant-SmbShareAccess -Name 'CompanyData' -AccountName 'Authenticated Users' -AccessRight Read -Force -ErrorAction SilentlyContinue | Out-Null

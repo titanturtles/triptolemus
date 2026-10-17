@@ -2,8 +2,8 @@
   "format": 1,
   "os": "linux",
   "title": "Week 1 Advanced: Accounts (Linux)",
-  "readme": "You administer this workstation. A security review found account problems. Fix them without removing people the company needs.\n\nAuthorized users: alice, bob, carol, dave, frank.\nAuthorized administrators: you, and alice.\n\nCompany policy requires tidy accounts: only authorized people, only authorized admins, no service-account logins, no stray groups, no shared or hidden privilege, and passwords kept current. Some problems are not obvious from the user list alone.\n\nStaff also rely on the SSH remote-login service on this machine, which has been left stopped and insecure. Bring it back into service so an authorized user can log in, and harden it: root must not be able to log in over SSH and empty passwords must be refused.\n\nThere are 13 problems, 20 points each. Removing an authorized user is a penalty.",
-  "setup": "\nset -e\n# Baseline for Week 1 (Accounts) Advanced. Forces each problem into place.\npw() { printf '%s' \"$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)Aa1!\"; }\nfor u in alice bob carol dave frank mallory eve ghost; do\n    id \"$u\" >/dev/null 2>&1 || useradd -m -s /bin/bash \"$u\"\n    echo \"$u:$(pw)\" | chpasswd\ndone\n# alice is the authorized administrator\nusermod -aG sudo alice\n# 1-3) mallory, eve, ghost are unauthorized. 4) a second account hijacking UID 0.\nid lgates >/dev/null 2>&1 || useradd -o -u 0 -g 0 -M lgates\necho \"lgates:$(pw)\" | chpasswd\n# 5-6) bob and carol should be normal users, not admins\nusermod -aG sudo bob\nusermod -aG sudo carol\n# 7) a real user left in the shadow group\nusermod -aG shadow bob\n# 8) the www-data service account can log in\nid www-data >/dev/null 2>&1 || useradd -r www-data\nusermod -s /bin/bash www-data\n# 9) an unauthorized group\ngetent group pirates >/dev/null || groupadd pirates\n# 10) dave's password is old and not forced to change (reset the aging so the fix is needed)\nchage -d 20000 dave\n\n# --- Remote-login service (SSH): left stopped and insecure. The student must bring it back\n#     into service for an authorized user and harden it, without weakening account security. ---\ninstall -d -m 755 /opt/ptcheck\nDEBIAN_FRONTEND=noninteractive apt-get install -y -q openssh-server >/dev/null 2>&1 || true\nrm -f /opt/ptcheck/alice_id /opt/ptcheck/alice_id.pub\nssh-keygen -t ed25519 -N '' -q -f /opt/ptcheck/alice_id\nchmod 600 /opt/ptcheck/alice_id   # a default ACL on /opt can widen it; ssh refuses a group/other-readable key\ninstall -d -m 700 -o alice -g alice /home/alice/.ssh\ncp /opt/ptcheck/alice_id.pub /home/alice/.ssh/authorized_keys\nchown alice:alice /home/alice/.ssh/authorized_keys\nchmod 600 /home/alice/.ssh/authorized_keys\nprintf 'PT-SSH-OK-7F3A\\n' > /home/alice/sentinel.txt\nchown alice:alice /home/alice/sentinel.txt\ninstall -d -m 755 /etc/ssh/sshd_config.d\nprintf 'PermitRootLogin yes\\nPermitEmptyPasswords yes\\n' > /etc/ssh/sshd_config.d/99-ptcomp.conf\nsystemctl disable --now ssh >/dev/null 2>&1 || systemctl disable --now sshd >/dev/null 2>&1 || true\n",
+  "readme": "You administer this workstation. A security review found account problems. Fix them without removing people the company needs.\n\nAuthorized users: alice, bob, carol, dave, frank.\nAuthorized administrators: you, and alice.\n\nCompany policy requires tidy accounts: only authorized people, only authorized admins, no service-account logins, no stray groups, no shared or hidden privilege, and passwords kept current. Some problems are not obvious from the user list alone.\n\nStaff also rely on the SSH remote-login service on this machine, which has been left stopped and insecure. Bring it back into service so an authorized user can log in, and harden it: root must not be able to log in over SSH and empty passwords must be refused.\n\nStaff also use an internal web status page served on this machine (port 8099). It has been left stopped and bound to every network interface. Bring it back into service and make sure it listens on localhost only.\n\nThere are 15 problems, 20 points each. Removing an authorized user is a penalty.",
+  "setup": "\nset -e\n# Baseline for Week 1 (Accounts) Advanced. Forces each problem into place.\npw() { printf '%s' \"$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)Aa1!\"; }\nfor u in alice bob carol dave frank mallory eve ghost; do\n    id \"$u\" >/dev/null 2>&1 || useradd -m -s /bin/bash \"$u\"\n    echo \"$u:$(pw)\" | chpasswd\ndone\n# alice is the authorized administrator\nusermod -aG sudo alice\n# 1-3) mallory, eve, ghost are unauthorized. 4) a second account hijacking UID 0.\nid lgates >/dev/null 2>&1 || useradd -o -u 0 -g 0 -M lgates\necho \"lgates:$(pw)\" | chpasswd\n# 5-6) bob and carol should be normal users, not admins\nusermod -aG sudo bob\nusermod -aG sudo carol\n# 7) a real user left in the shadow group\nusermod -aG shadow bob\n# 8) the www-data service account can log in\nid www-data >/dev/null 2>&1 || useradd -r www-data\nusermod -s /bin/bash www-data\n# 9) an unauthorized group\ngetent group pirates >/dev/null || groupadd pirates\n# 10) dave's password is old and not forced to change (reset the aging so the fix is needed)\nchage -d 20000 dave\n\n# --- Remote-login service (SSH): left stopped and insecure. The student must bring it back\n#     into service for an authorized user and harden it, without weakening account security. ---\ninstall -d -m 755 /opt/ptcheck\nDEBIAN_FRONTEND=noninteractive apt-get install -y -q openssh-server >/dev/null 2>&1 || true\nrm -f /opt/ptcheck/alice_id /opt/ptcheck/alice_id.pub\nssh-keygen -t ed25519 -N '' -q -f /opt/ptcheck/alice_id\nchmod 600 /opt/ptcheck/alice_id   # a default ACL on /opt can widen it; ssh refuses a group/other-readable key\ninstall -d -m 700 -o alice -g alice /home/alice/.ssh\ncp /opt/ptcheck/alice_id.pub /home/alice/.ssh/authorized_keys\nchown alice:alice /home/alice/.ssh/authorized_keys\nchmod 600 /home/alice/.ssh/authorized_keys\nprintf 'PT-SSH-OK-7F3A\\n' > /home/alice/sentinel.txt\nchown alice:alice /home/alice/sentinel.txt\ninstall -d -m 755 /etc/ssh/sshd_config.d\nprintf 'PermitRootLogin yes\\nPermitEmptyPasswords yes\\n' > /etc/ssh/sshd_config.d/99-ptcomp.conf\nsystemctl disable --now ssh >/dev/null 2>&1 || systemctl disable --now sshd >/dev/null 2>&1 || true\n\n# --- Internal web status service: left stopped and exposed to the whole network. Bring it back\n#     up and bind it to localhost only. ---\nid ptweb >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin ptweb\ninstall -d -m 755 /srv/ptweb\nprintf 'PT-WEB-OK-5B2C\\n' > /srv/ptweb/sentinel.txt\nchmod 644 /srv/ptweb/sentinel.txt\ncat > /etc/systemd/system/ptweb.service <<'UNIT'\n[Unit]\nDescription=PT Comp internal status web service\nAfter=network.target\n[Service]\nUser=ptweb\nExecStart=/usr/bin/python3 -m http.server 8099 --bind 0.0.0.0 --directory /srv/ptweb\nRestart=no\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload >/dev/null 2>&1 || true\nsystemctl disable --now ptweb >/dev/null 2>&1 || true\n",
   "checks": [
     {
       "message": "Removed the unauthorized user mallory",
@@ -147,6 +147,31 @@
         {
           "type": "Command",
           "cmd": "/usr/sbin/sshd -T 2>/dev/null | grep -qi '^permitemptypasswords no'"
+        }
+      ]
+    },
+    {
+      "message": "The internal web service is running and serves its status page",
+      "points": 20,
+      "pass": [
+        {
+          "type": "ServiceUp",
+          "name": "ptweb"
+        },
+        {
+          "type": "CommandContains",
+          "cmd": "curl -s --max-time 5 http://127.0.0.1:8099/sentinel.txt",
+          "value": "PT-WEB-OK-5B2C"
+        }
+      ]
+    },
+    {
+      "message": "The web service is not exposed to the network (listens on localhost only)",
+      "points": 20,
+      "pass": [
+        {
+          "type": "Command",
+          "cmd": "ss -ltn | grep -q '127.0.0.1:8099' && ! ss -ltn | grep -q '0.0.0.0:8099'"
         }
       ]
     },
