@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.4"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.5"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1706,6 +1706,48 @@ def comp_cfg(shared, competition):
     return c
 
 
+# ---------------- Weekly Sprint grouping (Cisco competition picker) ----------------
+# The scoreboard shows the Cisco unit practices regrouped by week into two divisions. The agent
+# offers the same view in its competition picker: the practice's course unit comes from its name
+# ("U4.M13. VLANs" -> unit 4), and each division maps units to weeks. High School's first sprint is
+# units 1-4, then one unit a week (unit 10 skipped); Middle School is one unit per week.
+SPRINT_HS_WEEKS = [(1, [1, 2, 3, 4]), (2, [5]), (3, [6]), (4, [7]), (5, [8]),
+                   (6, [9]), (7, [11]), (8, [12]), (9, [13, 14]), (10, [15, 16])]
+
+
+def comp_unit(name):
+    """The course unit a practice belongs to, read from its name ("U4.M13. …" -> 4; "13 · …" -> 13)."""
+    m = re.match(r"\s*U(\d+)", name or "") or re.match(r"\s*(\d+)", name or "")
+    return int(m.group(1)) if m else 0
+
+
+def sprint_week_map(division, comps):
+    """unit -> week number for a division. MS numbers weeks over whichever units are present."""
+    if division == "ms":
+        units = sorted({comp_unit(c.get("name", "")) for c in comps if comp_unit(c.get("name", ""))})
+        return {u: i + 1 for i, u in enumerate(units)}
+    wm = {}
+    for wk, units in SPRINT_HS_WEEKS:
+        for u in units:
+            wm[u] = wk
+    return wm
+
+
+def sprint_order(comps, division):
+    """Return comps labelled + ordered by week for the chosen division: list of (label, comp).
+    Practices whose unit isn't in the division's schedule are listed last, unlabelled."""
+    wm = sprint_week_map(division, comps)
+    rows = []
+    for c in comps:
+        u = comp_unit(c.get("name", ""))
+        wk = wm.get(u)
+        nm = c.get("name") or c.get("comp") or "(unnamed)"
+        label = f"W{wk} · {nm}" if wk else nm
+        rows.append((wk or 1 << 30, u or 1 << 30, nm, label, c))
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return [(label, c) for _, _, _, label, c in rows]
+
+
 # ---------------- AI-use check (competition integrity) ----------------
 # While a level runs in a competition with the AI check on, look for AI assistants and report
 # what is found to levelsvc POST /aiflag. Students are told the check is on; nothing is shown when
@@ -2480,6 +2522,18 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
     ttk.Label(compbar, text="Competition:").pack(side="left")
     combo = ttk.Combobox(compbar, textvariable=sel_var, state="readonly", width=34)
     combo.pack(side="left", padx=6)
+
+    # Weekly Sprint view: regroup the competition list by week for the student's division (HS/MS).
+    DIV_LABELS = {"High School": "hs", "Middle School": "ms"}
+    DIV_BY_KEY = {v: k for k, v in DIV_LABELS.items()}
+    sprint_var = tk.BooleanVar(value=bool(state.get("sprint_view")))
+    div_var = tk.StringVar(value=DIV_BY_KEY.get(state.get("sprint_division", "hs"), "High School"))
+    sprint_chk = ttk.Checkbutton(compbar, text="Weekly Sprint")  # command wired below
+    sprint_chk.configure(variable=sprint_var)
+    sprint_chk.pack(side="left", padx=(10, 2))
+    div_combo = ttk.Combobox(compbar, textvariable=div_var, state="readonly", width=14,
+                             values=list(DIV_LABELS.keys()))
+    div_combo.pack(side="left", padx=2)
 
     # practice-only controls (shown by select_comp when the chosen competition is practice):
     # an "Unlock all levels" toggle + a level picker so the student can jump around freely.
@@ -3297,6 +3351,44 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         nm = c.get("name") or c.get("comp")
         status_var.set(f"Selected “{nm}”. Enter your Team ID and click Start.")
 
+    def repopulate_combo(default_comp=None):
+        """(Re)fill the Cisco competition combo from ENR["comps"], grouped by week when Weekly
+        Sprint is on. Keeps the currently selected competition selected across a relabel."""
+        comps = ENR["comps"]
+        cur_comp = (ENR["by_name"].get(sel_var.get()) or {}).get("comp") if ENR["by_name"] else None
+        ENR["by_name"] = {}
+        if sprint_var.get():
+            pairs = sprint_order(comps, DIV_LABELS.get(div_var.get(), "hs"))
+        else:
+            pairs = [((c.get("name") or c.get("comp") or "(unnamed)"), c) for c in comps]
+        names = []
+        for label, c in pairs:
+            nm, base, i = label, label, 2
+            while nm in ENR["by_name"]:
+                nm = f"{base} ({i})"
+                i += 1
+            ENR["by_name"][nm] = c
+            names.append(nm)
+        combo.configure(values=names)
+        div_combo.configure(state=("readonly" if sprint_var.get() else "disabled"))
+        target = default_comp or cur_comp
+        pick = next((nm for nm, c in ENR["by_name"].items() if c.get("comp") == target), None) if target else None
+        if not pick and names:
+            pick = names[0]
+        if pick:
+            sel_var.set(pick)
+            select_comp()
+        else:
+            rebuild_cards([])
+
+    def on_sprint_change(*_):
+        save_state(conf_dir, {"sprint_view": bool(sprint_var.get()),
+                              "sprint_division": DIV_LABELS.get(div_var.get(), "hs")})
+        repopulate_combo()
+    sprint_chk.configure(command=on_sprint_change)
+    div_combo.bind("<<ComboboxSelected>>", on_sprint_change)
+    div_combo.configure(state=("readonly" if sprint_var.get() else "disabled"))
+
     def apply_enrollment(shared, comps, default_comp):
         by_kind = {}
         for c in comps:
@@ -3305,24 +3397,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_fill(T, by_kind.get(kind, []))
         everything, comps = comps, by_kind.get("cisco", [])
         ENR["shared"], ENR["comps"], ENR["by_name"] = shared, comps, {}
-        names = []
-        for c in comps:
-            nm = c.get("name") or c.get("comp") or "(unnamed)"
-            base, i = nm, 2
-            while nm in ENR["by_name"]:
-                nm = f"{base} ({i})"
-                i += 1
-            ENR["by_name"][nm] = c
-            names.append(nm)
-        combo.configure(values=names)
-        pick = next((nm for nm, c in ENR["by_name"].items() if c.get("comp") == default_comp), None)
-        if not pick and names:
-            pick = names[0]
-        if pick:
-            sel_var.set(pick)
-            select_comp()
-        else:
-            rebuild_cards([])
+        repopulate_combo(default_comp)
         if not everything:
             status_var.set("No competitions available yet. Ask your instructor, then click Reload.")
         counts = ", ".join(f"{len(v)} {k}" for k, v in sorted(by_kind.items()))
@@ -3414,6 +3489,19 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
                                      {"comp": "lin1", "name": "Linux Basics 1", "kind": "linux", "practice": True,
                                       "levels": [{"level": 1, "name": "Users, firewall, files", "image": "l"}]}],
                          "demo")
+        if os.environ.get("PT_AGENT_SELFTEST_SPRINT"):   # the Weekly Sprint grouping of the Cisco picker
+            cis = [{"comp": f"p{u}", "name": nm, "practice": True,
+                    "levels": [{"level": 1, "name": "L1", "image": f"c{u}", "threshold": 100}]}
+                   for u, nm in [(1, "U1.M1. Intro"), (2, "U2.M2. Switching"), (3, "U3.M3. VLANs"),
+                                 (4, "U4.M4. Routing"), (5, "U5.M5. OSPF"), (11, "U11.M11. ACLs"),
+                                 (13, "U13.M13. WAN"), (14, "U14.M14. Security")]]
+            apply_enrollment(dict(cfg), cis, "p1")
+            sprint_var.set(True); div_var.set("High School"); on_sprint_change()
+            print("[sprint hs]", list(combo.cget("values")))
+            div_var.set("Middle School"); on_sprint_change()
+            print("[sprint ms]", list(combo.cget("values")))
+            sprint_var.set(False); on_sprint_change()
+            print("[sprint off]", list(combo.cget("values")))
         if os.environ.get("PT_AGENT_SELFTEST_TAB") in VM:   # a VM tab mid-practice, for screenshots
             T = VM[os.environ["PT_AGENT_SELFTEST_TAB"]]
             nb.select(T["frame"])
