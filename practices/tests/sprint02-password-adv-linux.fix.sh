@@ -4,8 +4,8 @@ set -e
 for u in rowan mmouse; do userdel -rf "$u" 2>/dev/null || userdel -f "$u"; done
 gpasswd -d vkinbott sudo >/dev/null 2>&1 || true
 # remove the UID-0 impostor; strip ANY non-root UID-0 account (a shared CI runner may carry one
-# from another practice — on a real single-scenario VM this is just lgates)
-pkill -KILL -u lgates 2>/dev/null || true
+# from another practice — on a real single-scenario VM this is just lgates). NOTE: never
+# `pkill -u lgates` — lgates shares UID 0 with root, so that would kill every root process.
 userdel -f lgates 2>/dev/null || true
 cp -f /etc/passwd /etc/passwd.ptbak
 awk -F: '!($3==0 && $1!="root")' /etc/passwd.ptbak > /etc/passwd
