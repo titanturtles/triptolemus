@@ -3,11 +3,13 @@
 set -e
 for u in rowan mmouse; do userdel -rf "$u" 2>/dev/null || userdel -f "$u"; done
 gpasswd -d vkinbott sudo >/dev/null 2>&1 || true
-userdel -rf lgates 2>/dev/null || userdel -f lgates 2>/dev/null || true
-if awk -F: '$3==0 && $1!="root"' /etc/passwd | grep -q lgates; then
-  sed -i '/^lgates:/d' /etc/passwd
-  sed -i '/^lgates:/d' /etc/shadow 2>/dev/null || true
-fi
+# remove the UID-0 impostor; strip ANY non-root UID-0 account (a shared CI runner may carry one
+# from another practice — on a real single-scenario VM this is just lgates)
+pkill -KILL -u lgates 2>/dev/null || true
+userdel -f lgates 2>/dev/null || true
+cp -f /etc/passwd /etc/passwd.ptbak
+awk -F: '!($3==0 && $1!="root")' /etc/passwd.ptbak > /etc/passwd
+rm -f /etc/passwd.ptbak
 # account policy
 sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' /etc/login.defs
 cat > /etc/security/pwquality.conf <<PWQ
