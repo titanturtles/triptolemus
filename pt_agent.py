@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.6"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.7"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -2894,7 +2894,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
     def _md_setup(w):
         if getattr(w, "_md_ready", False):
             return
-        base = tkfont.nametofont(w.cget("font"))
+        base = tkfont.Font(font=w.cget("font"))  # cget returns a spec ("TkDefaultFont 10"), not a named font
         fam, sz = base.actual("family"), base.actual("size")
         w.tag_configure("md_h1", font=(fam, sz + 6, "bold"), spacing1=10, spacing3=6)
         w.tag_configure("md_h2", font=(fam, sz + 3, "bold"), foreground="#1b4f72", spacing1=10, spacing3=4)
