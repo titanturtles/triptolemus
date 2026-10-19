@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.8"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.9"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1446,9 +1446,12 @@ class VMPractice:
         self.report("state", "idle")
 
     def _setup(self, scen, title):
+        s = scen.get("setup", "")
+        est = 240 if ("choco" in s or "Install-Real" in s) else 30  # heavy (real software installs) vs light
+        self.report("progress_begin", {"eta": est})
         self.report("status", f"Setting up {title}. This can take a few minutes (installing software)…")
         self.report("log", f"Setting up {title}…")
-        code, out, err = run_script(scen.get("setup", ""), timeout=900)
+        code, out, err = run_script(s, timeout=900)
         if code != 0:
             raise PracticeError(f"The practice setup failed (exit code {code}).\n\n{(err or out).strip()[-600:]}\n\n"
                                 "Restore your Clean snapshot and try again. Tell your instructor if it keeps "
@@ -3001,10 +3004,10 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["levels_label"].pack(anchor="w", pady=(2, 0))
         # animated "working" bar, shown only while a practice is setting up (packed/unpacked by vm_set_state)
         T["progress_frame"] = ttk.Frame(f)
-        T["progress"] = ttk.Progressbar(T["progress_frame"], mode="indeterminate", length=260)
+        T["progress"] = ttk.Progressbar(T["progress_frame"], mode="determinate", maximum=100, length=260)
         T["progress"].pack(side="left", padx=(0, 8), pady=2)
-        ttk.Label(T["progress_frame"], foreground="#2f5e97",
-                  text="Setting up the practice on this VM… this can take a few minutes.").pack(side="left")
+        T["prog_var"] = tk.StringVar(value="Setting up the practice on this VM…")
+        ttk.Label(T["progress_frame"], textvariable=T["prog_var"], foreground="#2f5e97").pack(side="left")
         T["note"] = tk.Label(f, justify="left", anchor="w", wraplength=630, padx=8, pady=5)  # packed by vm_note
         # the README above, the score below, and a bar between them to drag; both grow with the window
         split = tk.PanedWindow(f, orient="vertical", sashwidth=9, sashrelief="raised", opaqueresize=True,
@@ -3033,23 +3036,45 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         vm_set_state(T, "idle")
         return T
 
+    def vm_prog_tick(T):
+        # advance a determinate "setting up" bar from elapsed time vs. the reported estimate; it eases
+        # toward 95% and holds ("finishing up…") if setup runs long, then snaps to 100% on completion.
+        if not T.get("progress_on"):
+            return
+        est = max(5, T.get("prog_est", 30))
+        elapsed = time.monotonic() - T.get("prog_start", time.monotonic())
+        frac = min(0.95, elapsed / est)
+        T["progress"].configure(value=int(frac * 100))
+        remain = est - elapsed
+        if remain > 1:
+            m, s = divmod(int(remain + 0.5), 60)
+            eta = f"~{m}m {s:02d}s left" if m else f"~{s}s left"
+        else:
+            eta = "finishing up…"
+        T["prog_var"].set(f"Setting up… {int(frac * 100)}%  ·  {eta}")
+        T["progress"].after(500, lambda: vm_prog_tick(T))
+
     def vm_set_state(T, st):
         T["state"] = st
         idle = st == "idle"
         T["start"].configure(state=("normal" if idle and T["can_start"] else "disabled"))
         T["stop"].configure(state=("normal" if st == "running" else "disabled"))
         T["combo"].configure(state=("readonly" if idle else "disabled"))
-        pf = T.get("progress_frame")   # an indeterminate bar animates only while setting up (state == busy)
+        pf = T.get("progress_frame")   # determinate %/ETA bar while a practice is setting up (state == busy)
         if pf is not None:
-            want = (st == "busy")
-            if want and not T.get("progress_on"):
-                pf.pack(anchor="w", fill="x", pady=(2, 0), before=T["split"])
-                T["progress"].start(12)
+            if st == "busy" and not T.get("progress_on"):
                 T["progress_on"] = True
-            elif not want and T.get("progress_on"):
-                T["progress"].stop()
-                pf.pack_forget()
+                T["prog_start"] = time.monotonic()
+                T["prog_est"] = 30
+                T["progress"].configure(value=0)
+                T["prog_var"].set("Setting up the practice on this VM…")
+                pf.pack(anchor="w", fill="x", pady=(2, 0), before=T["split"])
+                vm_prog_tick(T)
+            elif st != "busy" and T.get("progress_on"):
                 T["progress_on"] = False
+                if st == "running":
+                    T["progress"].configure(value=100)
+                pf.pack_forget()
         topbar_buttons()
         vm_note(T)
 
@@ -3356,6 +3381,8 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
                 pass
         elif sub == "state":
             vm_set_state(T, payload)
+        elif sub == "progress_begin":
+            T["prog_est"] = max(5, int(payload.get("eta", 30)))
         elif sub == "cards":
             vm_cards(T, payload)
         elif sub == "readme":
