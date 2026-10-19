@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.9"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.10"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1164,6 +1164,65 @@ def _ps_errors(text):
     return "".join(html.unescape(p).replace("_x000D__x000A_", "\n") for p in parts).strip() or text
 
 
+def run_script_streamed(script, on_line, timeout=900):
+    """Like run_script, but invokes on_line(text) for each stdout line as it arrives, so a long setup
+    can report progress markers while it runs. Returns (exit code, full stdout, stderr)."""
+    tmp = None
+    if sys.platform.startswith("win"):
+        script = "$ProgressPreference = 'SilentlyContinue'\n" + script
+        argv = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        if len(script) < 8000:
+            argv += ["-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
+        else:
+            fd, tmp = tempfile.mkstemp(suffix=".ps1", prefix="ptagent_")
+            with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+                f.write(script)
+            argv += ["-File", tmp]
+    else:
+        argv = [shutil.which("bash") or "/bin/sh", "-c", script]
+        env = system_env()
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=env, text=True, encoding="utf-8", errors="replace", **NO_WINDOW)
+    timed_out = {"v": False}
+
+    def _watch():
+        end = time.monotonic() + timeout
+        while p.poll() is None:
+            if time.monotonic() > end:
+                timed_out["v"] = True
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                return
+            time.sleep(0.5)
+    threading.Thread(target=_watch, daemon=True).start()
+    out = []
+    try:
+        for line in p.stdout:
+            out.append(line)
+            try:
+                on_line(line.rstrip("\r\n"))
+            except Exception:
+                pass
+    finally:
+        p.wait()
+        try:
+            err = p.stderr.read()
+        except Exception:
+            err = ""
+    if tmp:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    code = p.returncode if not timed_out["v"] else (p.returncode or 124)
+    if timed_out["v"]:
+        err = (err + "\n(setup timed out)").strip()
+    return code, "".join(out), _ps_errors(err)
+
+
 def _ps(s):
     """A PowerShell single-quoted string literal."""
     return "'" + str(s).replace("'", "''") + "'"
@@ -1451,7 +1510,14 @@ class VMPractice:
         self.report("progress_begin", {"eta": est})
         self.report("status", f"Setting up {title}. This can take a few minutes (installing software)…")
         self.report("log", f"Setting up {title}…")
-        code, out, err = run_script(s, timeout=900)
+
+        def on_line(line):   # measured progress: setups may emit "@@PTP@@ <done> <total> <label>" markers
+            if line.startswith("@@PTP@@"):
+                parts = line.split(None, 3)
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    self.report("progress", {"done": int(parts[1]), "total": int(parts[2]),
+                                             "label": parts[3] if len(parts) > 3 else ""})
+        code, out, err = run_script_streamed(s, on_line, timeout=900)
         if code != 0:
             raise PracticeError(f"The practice setup failed (exit code {code}).\n\n{(err or out).strip()[-600:]}\n\n"
                                 "Restore your Clean snapshot and try again. Tell your instructor if it keeps "
@@ -3036,22 +3102,35 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         vm_set_state(T, "idle")
         return T
 
-    def vm_prog_tick(T):
-        # advance a determinate "setting up" bar from elapsed time vs. the reported estimate; it eases
-        # toward 95% and holds ("finishing up…") if setup runs long, then snaps to 100% on completion.
-        if not T.get("progress_on"):
-            return
-        est = max(5, T.get("prog_est", 30))
-        elapsed = time.monotonic() - T.get("prog_start", time.monotonic())
-        frac = min(0.95, elapsed / est)
-        T["progress"].configure(value=int(frac * 100))
-        remain = est - elapsed
+    def _eta_text(remain):
         if remain > 1:
             m, s = divmod(int(remain + 0.5), 60)
-            eta = f"~{m}m {s:02d}s left" if m else f"~{s}s left"
+            return f"~{m}m {s:02d}s left" if m else f"~{s}s left"
+        return "finishing up…"
+
+    def vm_prog_tick(T):
+        # If the setup emits step markers, show MEASURED progress with an ETA learned from how long the
+        # completed steps actually took; otherwise fall back to a time estimate. Snaps to 100% on finish.
+        if not T.get("progress_on"):
+            return
+        now = time.monotonic()
+        mark = T.get("prog_mark")
+        if mark:
+            done, total, label, mt, me = mark
+            total = max(1, total)
+            completed = max(0, done - 1)
+            base, nxt = completed / total, min(1.0, done / total)
+            step_elapsed = now - mt
+            avg = max(2.0, (me / completed) if completed >= 1 else max(5, T.get("prog_est", 30)) / total)
+            frac = min(0.98, base + min(0.95, step_elapsed / avg) * (nxt - base))
+            eta = _eta_text(avg * (total - completed) - step_elapsed)
+            T["prog_var"].set((f"{label}  ·  " if label else "") + f"{int(frac * 100)}%  ·  {eta}")
         else:
-            eta = "finishing up…"
-        T["prog_var"].set(f"Setting up… {int(frac * 100)}%  ·  {eta}")
+            est = max(5, T.get("prog_est", 30))
+            elapsed = now - T.get("prog_start", now)
+            frac = min(0.95, elapsed / est)
+            T["prog_var"].set(f"Setting up… {int(frac * 100)}%  ·  {_eta_text(est - elapsed)}")
+        T["progress"].configure(value=int(frac * 100))
         T["progress"].after(500, lambda: vm_prog_tick(T))
 
     def vm_set_state(T, st):
@@ -3066,6 +3145,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
                 T["progress_on"] = True
                 T["prog_start"] = time.monotonic()
                 T["prog_est"] = 30
+                T["prog_mark"] = None
                 T["progress"].configure(value=0)
                 T["prog_var"].set("Setting up the practice on this VM…")
                 pf.pack(anchor="w", fill="x", pady=(2, 0), before=T["split"])
@@ -3383,6 +3463,10 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
             vm_set_state(T, payload)
         elif sub == "progress_begin":
             T["prog_est"] = max(5, int(payload.get("eta", 30)))
+        elif sub == "progress":   # a measured step marker from the setup script
+            T["prog_mark"] = (int(payload.get("done", 0)), int(payload.get("total", 1)),
+                              payload.get("label", ""), time.monotonic(),
+                              time.monotonic() - T.get("prog_start", time.monotonic()))
         elif sub == "cards":
             vm_cards(T, payload)
         elif sub == "readme":
