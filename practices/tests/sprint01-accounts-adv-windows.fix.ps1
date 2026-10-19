@@ -21,14 +21,21 @@ foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
     Remove-Item -Path (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Remote-management service: least-privilege the account, drop unauthorized remote access, bring WinRM up
-Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'svc_wsman' -ErrorAction SilentlyContinue
+# WinRM: least-privilege the service account, drop the rogue remote user, harden the config, keep it RUNNING
+Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member 'svc_wsman'  -ErrorAction SilentlyContinue
 Remove-LocalGroupMember -SID 'S-1-5-32-580' -Member 'wsmanguest' -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service' -Name 'AllowUnencryptedTraffic' -Type DWord -Value 0
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service' -Name 'AllowBasic'              -Type DWord -Value 0
 Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
-try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null } catch { }
 Start-Service -Name WinRM -ErrorAction SilentlyContinue
-# CompanyData share: bring the Server service back and remove the Everyone grant
+
+# CompanyData: tighten SMB, remove the Everyone grant, keep the file server RUNNING
+$lsp = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+Set-ItemProperty -Path $lsp -Name 'SMB1'                     -Type DWord -Value 0
+Set-ItemProperty -Path $lsp -Name 'RequireSecuritySignature' -Type DWord -Value 1
+Set-ItemProperty -Path $lsp -Name 'EnableSecuritySignature'  -Type DWord -Value 1
+Set-ItemProperty -Path $lsp -Name 'RestrictNullSessAccess'   -Type DWord -Value 1
 Set-Service -Name LanmanServer -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service -Name LanmanServer -ErrorAction SilentlyContinue
 Revoke-SmbShareAccess -Name 'CompanyData' -AccountName 'Everyone' -Force -ErrorAction SilentlyContinue | Out-Null
-Grant-SmbShareAccess -Name 'CompanyData' -AccountName 'Authenticated Users' -AccessRight Read -Force -ErrorAction SilentlyContinue | Out-Null
+Grant-SmbShareAccess  -Name 'CompanyData' -AccountName 'Authenticated Users' -AccessRight Read -Force -ErrorAction SilentlyContinue | Out-Null

@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.5"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.6"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -2431,7 +2431,7 @@ class AIWatcher:
 def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
     import threading, queue
     import tkinter as tk
-    from tkinter import ttk, scrolledtext, messagebox
+    from tkinter import ttk, scrolledtext, messagebox, font as tkfont
 
     state = load_state(conf_dir)
     msgq = queue.Queue()
@@ -2888,6 +2888,73 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         widget.insert("1.0", text)
         widget.configure(state="disabled")
 
+    # ---- lightweight Markdown rendering for the README pane ----
+    _MD_INLINE = re.compile(r"\*\*(?P<b>.+?)\*\*|`(?P<c>[^`]+)`")
+
+    def _md_setup(w):
+        if getattr(w, "_md_ready", False):
+            return
+        base = tkfont.nametofont(w.cget("font"))
+        fam, sz = base.actual("family"), base.actual("size")
+        w.tag_configure("md_h1", font=(fam, sz + 6, "bold"), spacing1=10, spacing3=6)
+        w.tag_configure("md_h2", font=(fam, sz + 3, "bold"), foreground="#1b4f72", spacing1=10, spacing3=4)
+        w.tag_configure("md_h3", font=(fam, sz + 1, "bold"), spacing1=6, spacing3=2)
+        w.tag_configure("md_b", font=(fam, sz, "bold"))
+        w.tag_configure("md_code", font=("TkFixedFont", sz), background="#eef1f4")
+        w.tag_configure("md_bullet", lmargin1=16, lmargin2=30)
+        w.tag_configure("md_num", lmargin1=16, lmargin2=34)
+        w.tag_configure("md_hr", foreground="#aab4c0", spacing1=4, spacing3=4)
+        w._md_ready = True
+
+    def _md_inline(w, s, base):
+        pos = 0
+        for m in _MD_INLINE.finditer(s):
+            if m.start() > pos:
+                w.insert("end", s[pos:m.start()], base)
+            if m.group("b") is not None:
+                w.insert("end", m.group("b"), base + ("md_b",))
+            else:
+                w.insert("end", m.group("c"), base + ("md_code",))
+            pos = m.end()
+        if pos < len(s):
+            w.insert("end", s[pos:], base)
+
+    def render_readme(widget, text):
+        """Render a small subset of Markdown (#/##/### headings, **bold**, `code`, - bullets,
+        1. numbers, --- rules) into the README Text widget; degrades to plain text."""
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        try:
+            _md_setup(widget)
+            for raw in (text or "").split("\n"):
+                line = raw.rstrip()
+                mh = re.match(r"^(#{1,3})\s+(.*)$", line)
+                if mh:
+                    _md_inline(widget, mh.group(2), ({1: "md_h1", 2: "md_h2", 3: "md_h3"}[len(mh.group(1))],))
+                    widget.insert("end", "\n")
+                    continue
+                if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
+                    widget.insert("end", "─" * 48 + "\n", ("md_hr",))
+                    continue
+                mb = re.match(r"^(\s*)[-*]\s+(.*)$", line)
+                if mb:
+                    widget.insert("end", mb.group(1) + "• ", ("md_bullet",))
+                    _md_inline(widget, mb.group(2), ("md_bullet",))
+                    widget.insert("end", "\n")
+                    continue
+                mn = re.match(r"^(\s*\d+\.)\s+(.*)$", line)
+                if mn:
+                    widget.insert("end", mn.group(1) + " ", ("md_num",))
+                    _md_inline(widget, mn.group(2), ("md_num",))
+                    widget.insert("end", "\n")
+                    continue
+                _md_inline(widget, line, ())
+                widget.insert("end", "\n")
+        except Exception:  # never let rendering break the pane — fall back to plain text
+            widget.delete("1.0", "end")
+            widget.insert("1.0", text or "")
+        widget.configure(state="disabled")
+
     def vm_tab(kind, title, os_label):
         f = ttk.Frame(nb, padding=(10, 8, 10, 8))
         nb.add(f, text=title)
@@ -3156,7 +3223,7 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
 
     def vm_readme(T, title, text):
         T["readme_title"].set(title)
-        set_text(T["readme"], text)
+        render_readme(T["readme"], text)
 
     def vm_results(T, payload):
         items = payload.get("items", [])
