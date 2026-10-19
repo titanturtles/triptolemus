@@ -42,7 +42,7 @@ except Exception:
 DELIM = (chr(255) + chr(222)).encode("utf-8")
 CONF_DEFAULT = "pt_agent.conf.json"
 STATE_FILE = "pt_agent.state.json"
-AGENT_VERSION = "1.2.7"  # bump on every published build; the server advertises the latest
+AGENT_VERSION = "1.2.8"  # bump on every published build; the server advertises the latest
 
 
 # ---------------- sarpedon /update protocol (matches aeacus; tested) ----------------
@@ -1446,7 +1446,7 @@ class VMPractice:
         self.report("state", "idle")
 
     def _setup(self, scen, title):
-        self.report("status", f"Setting up {title}. This can take a minute…")
+        self.report("status", f"Setting up {title}. This can take a few minutes (installing software)…")
         self.report("log", f"Setting up {title}…")
         code, out, err = run_script(scen.get("setup", ""), timeout=900)
         if code != 0:
@@ -2999,11 +2999,18 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["levels_var"] = tk.StringVar(value="")
         T["levels_label"] = ttk.Label(f, textvariable=T["levels_var"], foreground="#555", wraplength=640)
         T["levels_label"].pack(anchor="w", pady=(2, 0))
+        # animated "working" bar, shown only while a practice is setting up (packed/unpacked by vm_set_state)
+        T["progress_frame"] = ttk.Frame(f)
+        T["progress"] = ttk.Progressbar(T["progress_frame"], mode="indeterminate", length=260)
+        T["progress"].pack(side="left", padx=(0, 8), pady=2)
+        ttk.Label(T["progress_frame"], foreground="#2f5e97",
+                  text="Setting up the practice on this VM… this can take a few minutes.").pack(side="left")
         T["note"] = tk.Label(f, justify="left", anchor="w", wraplength=630, padx=8, pady=5)  # packed by vm_note
         # the README above, the score below, and a bar between them to drag; both grow with the window
         split = tk.PanedWindow(f, orient="vertical", sashwidth=9, sashrelief="raised", opaqueresize=True,
                                borderwidth=0, background="#b9c3cf")
         split.pack(fill="both", expand=True, pady=(6, 0))
+        T["split"] = split   # vm_set_state packs the setup progress bar just above this
         top, low = ttk.Frame(split), ttk.Frame(split)
         head = ttk.Frame(top)
         head.pack(fill="x")
@@ -3032,6 +3039,17 @@ def run_gui(cfg, conf_dir, cfg_path=None, tab=None):
         T["start"].configure(state=("normal" if idle and T["can_start"] else "disabled"))
         T["stop"].configure(state=("normal" if st == "running" else "disabled"))
         T["combo"].configure(state=("readonly" if idle else "disabled"))
+        pf = T.get("progress_frame")   # an indeterminate bar animates only while setting up (state == busy)
+        if pf is not None:
+            want = (st == "busy")
+            if want and not T.get("progress_on"):
+                pf.pack(anchor="w", fill="x", pady=(2, 0), before=T["split"])
+                T["progress"].start(12)
+                T["progress_on"] = True
+            elif not want and T.get("progress_on"):
+                T["progress"].stop()
+                pf.pack_forget()
+                T["progress_on"] = False
         topbar_buttons()
         vm_note(T)
 
