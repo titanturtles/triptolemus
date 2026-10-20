@@ -18,9 +18,36 @@ authorized user.
 
 Open an **elevated PowerShell** (Run as administrator) and run everything below there.
 
+Scored items are grouped below by **CyberPatriot vulnerability category** — the same breakdown the
+CyberPatriot Scoring Report uses to describe an image. Work top-to-bottom: answer Forensics first (before
+touching anything), then Account Management down through Unwanted Software; the Penalties section lists what
+loses points.
+
 ---
 
-## Accounts & groups
+## Forensics Questions
+
+_Questions you answer about the image; read and answer these BEFORE changing anything, since fixes can destroy the evidence._
+
+Enter answers in the agent's "Forensics…" panel. Artifacts live in **`C:\Users\Public\forensics`**.
+
+| Q | Question | Answer |
+|---|----------|--------|
+| fq1 | Decode the **hex** message in `C:\Users\Public\forensics` | **Running Up That Hill** (`q1_hex.txt` = `52756e...` → ASCII) |
+| fq2 | Decode the **Base64** message in `C:\Users\Public\forensics` | **stranger** (`q2_base64.txt` = `c3RyYW5nZXI=`) |
+
+Decode quickly in PowerShell:
+```powershell
+# fq1 — hex -> text
+$h = (Get-Content C:\Users\Public\forensics\q1_hex.txt).Trim()
+-join ($h -split '(?<=\G..)(?=.)' | ForEach-Object { [char][convert]::ToInt32($_,16) })
+# fq2 — base64 -> text
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\q2_base64.txt).Trim()))
+```
+
+## Account Management
+
+_Unauthorized accounts, administrator rights, required users and groups, group membership, guest account state, and rogue remote-access/account entries._
 
 | # | Check | Fix |
 |---|-------|-----|
@@ -32,46 +59,51 @@ Open an **elevated PowerShell** (Run as administrator) and run everything below 
 | 6 | Created the required group **dragonfire** | `New-LocalGroup -Name dragonfire` |
 | 7 | The **dragonfire** group has the required members | Add all seven: `foreach ($u in 'emunson','gareth','jeff','mwheeler','dhenderson','lsinclair','esinclair') { Add-LocalGroupMember -Group dragonfire -Member $u }` |
 
-## Password & account policy
+## Account & Password Policy
+
+_Password policy (length, age, complexity) and account-lockout policy._
 
 | # | Check | Fix |
 |---|-------|-----|
 | 8 | A secure **maximum password age** (1–90 days) | `net accounts /maxpwage:90` (or secpol.msc → Account Policies → Password Policy) |
 | 9 | A secure **account lockout threshold** (5–50) | `net accounts /lockoutthreshold:10 /lockoutduration:30 /lockoutwindow:30` |
+
+## Local Policies
+
+_Security Options, audit policy, and user-rights settings: blank-password and anonymous-enumeration (SAM) restrictions and LSA options._
+
+| # | Check | Fix |
+|---|-------|-----|
 | 10 | **Blank passwords** limited to console logon only | `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LimitBlankPasswordUse -Type DWord -Value 1` |
 | 11 | **Anonymous enumeration of SAM** disabled | `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RestrictAnonymousSAM -Type DWord -Value 1` |
 
-## Features & updates
+## Defensive Countermeasures
+
+_Firewall and antivirus / Windows Defender protections._
 
 | # | Check | Fix |
 |---|-------|-----|
 | 12 | The **firewall** is enabled | `Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True` |
-| 13 | **Remote Assistance** is disabled | `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name fAllowToGetHelp -Type DWord -Value 0` |
-| 14 | **Automatic updates** are enabled | `Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name NoAutoUpdate -Type DWord -Value 0` (value must not be 1) |
 
-## Prohibited software
+## Uncategorized Operating System Settings
 
-These are **really installed** now — each shows up in **Programs & Features** (Settings → Apps) with a
-publisher, version, size, and a working uninstaller, and has real files under `C:\Program Files\<name>`.
-The scoring passes once **both** the `Uninstall` registry key **and** the `C:\Program Files\<name>` folder
-are gone, so the cleanest fix is a proper uninstall (Settings → Apps → *Uninstall*, or run the app's
-`UninstallString`); the registry key and folder both disappear.
+_OS hardening that doesn't fit another category: registry toggles such as Remote Assistance, and SMB protocol / signing / null-session settings._
 
 | # | Check | Fix |
 |---|-------|-----|
-| 15 | **Wireshark** removed | Uninstall via Programs & Features, **or** remove `...\Uninstall\Wireshark` and `C:\Program Files\Wireshark` |
-| 16 | **NetStumbler** removed | Uninstall, **or** remove the `...\Uninstall\NetStumbler` key and `C:\Program Files\NetStumbler` |
-| 17 | **PC Cleaner** removed | Uninstall, **or** remove the `...\Uninstall\PC Cleaner` key and `C:\Program Files\PC Cleaner` |
+| 13 | **Remote Assistance** is disabled | `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name fAllowToGetHelp -Type DWord -Value 0` |
 
-A loop clears all three by force (equivalent to uninstalling):
-```powershell
-foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
-    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
-}
-```
+## Operating System & Application Updates
 
-## The two services — harden IN PLACE (do not stop them)
+_Automatic OS and application update settings._
+
+| # | Check | Fix |
+|---|-------|-----|
+| 14 | **Automatic updates** are enabled | `Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name NoAutoUpdate -Type DWord -Value 0` (value must not be 1) |
+
+## Service Auditing
+
+_Required services brought up and hardened IN PLACE (never by disabling them); includes each service's per-setting sub-checks._
 
 Both services start **running but misconfigured**. Secure each one **without stopping or disabling it** —
 leaving either stopped is a −10 penalty (see below).
@@ -106,30 +138,40 @@ Set-Service -Name LanmanServer -StartupType Automatic; Start-Service LanmanServe
 - Check 24 "SMB signing is required": `RequireSecuritySignature = 1`.
 - Check 25 "null-session access restricted": `RestrictNullSessAccess = 1`.
 
-## Forensics (enter in the agent's "Forensics…" panel)
+## Unwanted Software
 
-Artifacts live in **`C:\Users\Public\forensics`**.
+_Hacking tools and unauthorized applications that must be uninstalled (e.g. network sniffers, "PC cleaner" junkware)._
 
-| Q | Question | Answer |
-|---|----------|--------|
-| fq1 | Decode the **hex** message in `C:\Users\Public\forensics` | **Running Up That Hill** (`q1_hex.txt` = `52756e...` → ASCII) |
-| fq2 | Decode the **Base64** message in `C:\Users\Public\forensics` | **stranger** (`q2_base64.txt` = `c3RyYW5nZXI=`) |
+These are **really installed** now — each shows up in **Programs & Features** (Settings → Apps) with a
+publisher, version, size, and a working uninstaller, and has real files under `C:\Program Files\<name>`.
+The scoring passes once **both** the `Uninstall` registry key **and** the `C:\Program Files\<name>` folder
+are gone, so the cleanest fix is a proper uninstall (Settings → Apps → *Uninstall*, or run the app's
+`UninstallString`); the registry key and folder both disappear.
 
-Decode quickly in PowerShell:
+| # | Check | Fix |
+|---|-------|-----|
+| 15 | **Wireshark** removed | Uninstall via Programs & Features, **or** remove `...\Uninstall\Wireshark` and `C:\Program Files\Wireshark` |
+| 16 | **NetStumbler** removed | Uninstall, **or** remove the `...\Uninstall\NetStumbler` key and `C:\Program Files\NetStumbler` |
+| 17 | **PC Cleaner** removed | Uninstall, **or** remove the `...\Uninstall\PC Cleaner` key and `C:\Program Files\PC Cleaner` |
+
+A loop clears all three by force (equivalent to uninstalling):
 ```powershell
-# fq1 — hex -> text
-$h = (Get-Content C:\Users\Public\forensics\q1_hex.txt).Trim()
--join ($h -split '(?<=\G..)(?=.)' | ForEach-Object { [char][convert]::ToInt32($_,16) })
-# fq2 — base64 -> text
-[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\q2_base64.txt).Trim()))
+foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
+    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
+}
 ```
 
-## Penalties — do NOT trigger (−10 each)
+## Penalties
 
-- Do **not** uninstall / delete `C:\Program Files\Mozilla Firefox` (now a real Programs & Features entry).
-- Do **not** uninstall / delete `C:\Program Files\GIMP 2`.
-- Do **not** leave **WinRM** stopped — it must be running at scoring time.
-- Do **not** leave the **Server service (LanmanServer)** stopped — the file share must stay served.
+_Actions that LOSE points; each is noted with the category it relates to._
+
+Do **NOT** trigger these (−10 each):
+
+- Do **not** uninstall / delete `C:\Program Files\Mozilla Firefox` (now a real Programs & Features entry). *(relates to Unwanted Software)*
+- Do **not** uninstall / delete `C:\Program Files\GIMP 2`. *(relates to Unwanted Software)*
+- Do **not** leave **WinRM** stopped — it must be running at scoring time. *(relates to Service Auditing)*
+- Do **not** leave the **Server service (LanmanServer)** stopped — the file share must stay served. *(relates to Service Auditing)*
 
 Firefox and GIMP are legitimate installed applications — only **Wireshark**, **NetStumbler**, and
 **PC Cleaner** are prohibited. The service penalties exist so students can't "solve" a service vuln by

@@ -12,9 +12,17 @@ stopped. There are forensics questions, and **deleting a legitimate app costs po
 
 Open **PowerShell as Administrator** (right-click → Run as administrator). Everything below goes there.
 
+**How CyberPatriot scores this image.** A CyberPatriot Scoring Report groups an image's vulnerabilities
+into categories, and this one touches: **Forensics Questions**, **Account Management**, **Account &
+Password Policy**, **Local Policies**, **Defensive Countermeasures**, **Uncategorized Operating System
+Settings**, **Operating System & Application Updates**, **Service Auditing**, and **Unwanted Software** —
+plus a **Penalties** list of actions that lose points. Read and answer the Forensics Questions **first**,
+before you change anything, because a fix you make can destroy the evidence. The steps below follow that
+same category order.
+
 ---
 
-## 0. Recon first (look before you touch)
+## Recon first (look before you touch)
 
 ```powershell
 Get-LocalUser | Select Name, Enabled                       # who exists
@@ -31,7 +39,22 @@ list; **jbyers** and **mbauman** are authorized but are wrongly in Administrator
 an admin (it should be remote-management only); **wsmanguest** can manage the box remotely but isn't on
 the list at all.
 
-## 1. Accounts & groups
+## Forensics Questions
+
+The artifacts are in `C:\Users\Public\forensics`. Answer in the agent's "Forensics…" panel, and do it
+before you start changing the box.
+```powershell
+# Q1 — decode the hex
+$h = (Get-Content C:\Users\Public\forensics\q1_hex.txt).Trim()
+-join ($h -split '(?<=\G..)(?=.)' | ForEach-Object { [char][convert]::ToInt32($_,16) })    # -> Running Up That Hill
+
+# Q2 — decode the Base64
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\q2_base64.txt).Trim()))   # -> stranger
+```
+- **fq1** → `Running Up That Hill`
+- **fq2** → `stranger`
+
+## Account Management
 
 ```powershell
 Remove-LocalUser -Name pmckinney                           # unauthorized
@@ -53,59 +76,40 @@ Get-LocalGroupMember dragonfire     # verify all seven are present
 > ⚠️ Don't delete jbyers or mbauman — they're authorized, you only strip their admin rights. And don't
 > forget esinclair has to exist *before* you can add it to dragonfire.
 
-## 2. Password & account policy
+## Account & Password Policy
 
 ```powershell
 net accounts /maxpwage:90                                      # max password age in range (1–90)
 net accounts /lockoutthreshold:10 /lockoutduration:30 /lockoutwindow:30   # lockout after 10 bad tries
-
-Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LimitBlankPasswordUse -Type DWord -Value 1
-Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RestrictAnonymousSAM  -Type DWord -Value 1
 ```
 (The two `net accounts` settings are the same ones under `secpol.msc` → Account Policies if you prefer the GUI.)
 
-## 3. Features & updates
+## Local Policies
+
+```powershell
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LimitBlankPasswordUse -Type DWord -Value 1
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RestrictAnonymousSAM  -Type DWord -Value 1
+```
+
+## Defensive Countermeasures
 
 ```powershell
 Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True         # firewall on, all profiles
+```
+
+## Uncategorized Operating System Settings
+
+```powershell
 Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name fAllowToGetHelp -Type DWord -Value 0   # kill Remote Assistance
+```
+
+## Operating System & Application Updates
+
+```powershell
 Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name NoAutoUpdate -Type DWord -Value 0    # re-enable auto updates
 ```
 
-## 4. Prohibited software
-
-Three tools must go — **Wireshark**, **NetStumbler**, **PC Cleaner**. They're really installed: open
-**Settings → Apps → Installed apps** (or `appwiz.cpl`) and you'll see all three with a publisher and
-version. The normal way is to **Uninstall** each one there — that clears both the Programs & Features entry
-and the files on disk, which is exactly what the scoring checks for.
-
-If you'd rather script it, this force-removes the same two things (the uninstall registry key *and* the
-install folder) for all three:
-```powershell
-foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
-    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
-}
-```
-
-> ⚠️ **Mozilla Firefox** and **GIMP** are also in that Installed-apps list, and they're legitimate —
-> uninstalling or deleting either is −10. Only remove the three tools above.
-
-## 5. Forensics (answer in the agent's "Forensics…" panel)
-
-The artifacts are in `C:\Users\Public\forensics`.
-```powershell
-# Q1 — decode the hex
-$h = (Get-Content C:\Users\Public\forensics\q1_hex.txt).Trim()
--join ($h -split '(?<=\G..)(?=.)' | ForEach-Object { [char][convert]::ToInt32($_,16) })    # -> Running Up That Hill
-
-# Q2 — decode the Base64
-[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\q2_base64.txt).Trim()))   # -> stranger
-```
-- **fq1** → `Running Up That Hill`
-- **fq2** → `stranger`
-
-## 6. Harden the two services — IN PLACE, and keep them running
+## Service Auditing
 
 Both services are **already running** this time; they're just misconfigured. Secure each one **without
 stopping or disabling it** — if you leave WinRM or the file server stopped at scoring time, that's a −10
@@ -136,14 +140,43 @@ Get-Content \\localhost\CompanyData\sentinel.txt        # -> PT-SMB-OK-9A4D (sha
 Get-SmbShareAccess -Name CompanyData                    # no 'Everyone / Allow' entry remains
 ```
 
-## 7. Final sweep
+## Unwanted Software
 
-- Re-run the recon from step 0: only authorized users remain; Administrators has no jbyers/mbauman/svc_wsman;
+Three tools must go — **Wireshark**, **NetStumbler**, **PC Cleaner**. They're really installed: open
+**Settings → Apps → Installed apps** (or `appwiz.cpl`) and you'll see all three with a publisher and
+version. The normal way is to **Uninstall** each one there — that clears both the Programs & Features entry
+and the files on disk, which is exactly what the scoring checks for.
+
+If you'd rather script it, this force-removes the same two things (the uninstall registry key *and* the
+install folder) for all three:
+```powershell
+foreach ($s in 'Wireshark','NetStumbler','PC Cleaner') {
+    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
+}
+```
+
+> ⚠️ **Mozilla Firefox** and **GIMP** are also in that Installed-apps list, and they're legitimate —
+> uninstalling or deleting either is −10. Only remove the three tools above.
+
+## Penalties
+
+Four actions cost −10 each — avoid all of them:
+
+- Uninstalling or deleting **Mozilla Firefox** (`C:\Program Files\Mozilla Firefox`) — it's a legitimate app. *(relates to Unwanted Software)*
+- Uninstalling or deleting **GIMP** (`C:\Program Files\GIMP 2`) — also legitimate. *(relates to Unwanted Software)*
+- Leaving **WinRM** stopped at scoring time — harden it in place, don't turn it off. *(relates to Service Auditing)*
+- Leaving the **Server service (LanmanServer)** stopped — the file share must stay served. *(relates to Service Auditing)*
+
+## Final sweep
+
+- Re-run the recon from the top: only authorized users remain; Administrators has no jbyers/mbauman/svc_wsman;
   Remote Management Users has no wsmanguest; dragonfire has its seven members and esinclair exists.
 - `Get-Service WinRM, LanmanServer` → both **Running** (you hardened them without stopping them); the share
   serves its sentinel and Everyone is gone.
 - Confirm Firefox and GIMP are still installed (didn't earn a penalty).
 
 That's 25 hardening checks plus 2 forensics, with 4 penalties to avoid. In a real round, work top-down like
-this — recon, then accounts/groups, then policy/registry, then prohibited software, and leave the services for last so
-you can verify they still work after you harden them.
+this — recon, answer the forensics, then accounts, policy and local policies, firewall, Remote Assistance
+and updates, and finish with the two services and the prohibited software so you can verify the services
+still work after you harden them.

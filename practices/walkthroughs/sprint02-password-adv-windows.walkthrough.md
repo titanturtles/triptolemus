@@ -14,8 +14,31 @@ Open **PowerShell as Administrator**.
 
 ---
 
-## 0. Recon first
+**How CyberPatriot scores this image.** A CyberPatriot Scoring Report describes an image by **vulnerability
+category**, and this scenario's scored items fall, in order, under: **Forensics Questions**, **Account
+Management**, **Account & Password Policy**, **Local Policies**, **Defensive Countermeasures**,
+**Uncategorized Operating System Settings**, **Service Auditing**, **Malware**, **Unwanted Software**,
+**Prohibited Files**, and **Penalties**. Read and answer the **Forensics** questions FIRST — before you
+change anything — because a fix can destroy the evidence. Then work down the categories, saving the two
+services for last so you can confirm they still run.
 
+## Forensics Questions
+
+_Questions you answer about the image; read and answer these BEFORE changing anything, since fixes can destroy the evidence._
+
+(answer in the agent's "Forensics…" panel)
+
+```powershell
+Get-Content C:\Users\Public\meme.png -Stream Zone.Identifier    # HostUrl -> mordor-downloads.example  (fq1)
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\note.b64).Trim()))  # -> precious (fq2)
+```
+- **fq1** → `mordor-downloads.example`  · **fq2** → `precious`
+
+## Account Management
+
+_Unauthorized accounts, administrator rights, required users and groups, group membership, guest account state, and rogue remote-access/account entries._
+
+Recon first — enumerate accounts, groups, and the services you'll touch later:
 ```powershell
 Get-LocalUser | Select Name, Enabled
 Get-LocalGroupMember Administrators
@@ -27,8 +50,6 @@ Unauthorized accounts jump out: **sauron**, **saruman**, **gollum**, and **mordo
 wrongly in Administrators; **merry** in Event Log Readers; **pippin** and **mordoragent** in Remote
 Management Users; **svc_winrm** is wrongly an admin.
 
-## 1. Accounts & groups
-
 ```powershell
 Remove-LocalUser sauron; Remove-LocalUser saruman; Remove-LocalUser gollum
 Remove-LocalUser mordoragent                                              # rogue remote account
@@ -37,9 +58,11 @@ Remove-LocalGroupMember -Group 'Event Log Readers' -Member merry
 Remove-LocalGroupMember -Group 'Remote Management Users' -Member pippin
 ```
 
-## 2. Password & lockout policy (this week's focus)
+## Account & Password Policy
 
-Open **secpol.msc → Account Policies**, or script it with `secedit`:
+_Password policy (length, age, complexity, history) and account-lockout policy._
+
+This week's focus. Open **secpol.msc → Account Policies**, or script it with `secedit`:
 ```powershell
 $inf = "$env:TEMP\pw.inf"
 @"
@@ -61,56 +84,48 @@ secedit /configure /db "$env:TEMP\pw.sdb" /cfg $inf /areas SECURITYPOLICY
 ```
 (Complexity on, reversible encryption off, length ≥ 10, max age 1–90, lockout 1–10.)
 
-## 3. Local policy registry
+## Local Policies
+
+_Security Options, audit policy, and user-rights settings: blank-password and anonymous-enumeration (SAM) restrictions, LSA options, and audit logging._
 
 ```powershell
 $sys='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
 Set-ItemProperty $sys -Name DisableCAD -Type DWord -Value 0                 # require CTRL+ALT+DEL
 Set-ItemProperty $sys -Name ShutdownWithoutLogon -Type DWord -Value 0        # no shutdown without logon
-Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name NoDriveTypeAutoRun -Type DWord -Value 255   # autoplay off
 Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy' -Name Enabled -Type DWord -Value 1
-Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers' -Name DisableWebPnPDownload -Type DWord -Value 1
-Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\ProtectedEventLogging' -Name EnableProtectedEventLogging -Type DWord -Value 1
-Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name EnableSmartScreen -Type DWord -Value 1
-Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name DisableAntiSpyware -Type DWord -Value 0
 ```
 (Create a key first with `New-Item -Force` if `Set-ItemProperty` complains it doesn't exist.)
 
-## 4. Services off & firewall
+## Defensive Countermeasures
+
+_Firewall and antivirus / Windows Defender protections._
 
 ```powershell
-Set-Service Spooler -StartupType Disabled; Stop-Service Spooler -Force      # PrintNightmare
+Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name EnableSmartScreen -Type DWord -Value 1
+Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name DisableAntiSpyware -Type DWord -Value 0
 Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
 ```
 
-## 5. Prohibited software, files & tasks
+## Uncategorized Operating System Settings
 
-The three tools are really installed — uninstall them in **Settings → Apps**, or force-remove:
-```powershell
-foreach ($s in 'Wireshark','Nmap','TeamViewer') {
-    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
-}
-Remove-Item 'C:\Users\Public\Videos\gandalf_dance.mp4','C:\Users\Public\Music\one_ring.mp3' -Force
-Remove-Item 'C:\Users\Public\Documents\creditcards.txt','C:\Users\Public\Documents\passwords.txt' -Force
-schtasks /Delete /TN OrcGen /F                                             # 'orc generator' persistence
-```
-> ⚠️ **7-Zip** and **Notepad++** are also in the installed-apps list — they're legitimate. Removing either
-> is −10.
-
-## 6. Forensics (answer in the agent's "Forensics…" panel)
+_OS hardening that doesn't fit another category: registry toggles (Remote Assistance/RDP, UAC) and SMB protocol / signing / null-session settings._
 
 ```powershell
-Get-Content C:\Users\Public\meme.png -Stream Zone.Identifier    # HostUrl -> mordor-downloads.example  (fq1)
-[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content C:\Users\Public\forensics\note.b64).Trim()))  # -> precious (fq2)
+Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name NoDriveTypeAutoRun -Type DWord -Value 255   # autoplay off
+Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers' -Name DisableWebPnPDownload -Type DWord -Value 1
+Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\ProtectedEventLogging' -Name EnableProtectedEventLogging -Type DWord -Value 1
+Set-Service Spooler -StartupType Disabled; Stop-Service Spooler -Force      # PrintNightmare
 ```
-- **fq1** → `mordor-downloads.example`  · **fq2** → `precious`
 
-## 7. Bring the two services back — working AND secured
+## Service Auditing
+
+_Required services brought up and hardened IN PLACE (never by disabling them); includes each service's per-setting sub-checks._
+
+Bring the two services back — working AND secured.
 
 **WinRM.** Its service account is an admin and a rogue account can manage the box. Fix, then start it:
 ```powershell
-Remove-LocalGroupMember -Group Administrators -Member svc_winrm            # least-privilege (already removed mordoragent in step 1)
+Remove-LocalGroupMember -Group Administrators -Member svc_winrm            # least-privilege (already removed mordoragent under Account Management)
 Set-Service -Name WinRM -StartupType Automatic
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Start-Service WinRM
@@ -128,7 +143,44 @@ Get-Content \\localhost\CompanyData\sentinel.txt     # -> PT-SMB-OK-7B2E
 Get-SmbShareAccess -Name CompanyData                 # no 'Everyone / Allow' entry
 ```
 
-## 8. Final sweep
+## Malware
+
+_Attacker-planted footholds and backdoors: scheduled tasks, Run-key autoruns, malicious scripts/binaries._
+
+```powershell
+schtasks /Delete /TN OrcGen /F                                             # 'orc generator' persistence
+```
+
+## Unwanted Software
+
+_Hacking tools and unauthorized applications that must be uninstalled (e.g. network scanners, remote-access tools)._
+
+The three tools are really installed — uninstall them in **Settings → Apps**, or force-remove:
+```powershell
+foreach ($s in 'Wireshark','Nmap','TeamViewer') {
+    Remove-Item (Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $s) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path 'C:\Program Files' $s) -Recurse -Force -ErrorAction SilentlyContinue
+}
+```
+
+## Prohibited Files
+
+_Non-work-related media and disguised data files that must be removed._
+
+```powershell
+Remove-Item 'C:\Users\Public\Videos\gandalf_dance.mp4','C:\Users\Public\Music\one_ring.mp3' -Force
+Remove-Item 'C:\Users\Public\Documents\creditcards.txt','C:\Users\Public\Documents\passwords.txt' -Force
+```
+
+## Penalties
+
+_Actions that LOSE points; each is noted with the category it relates to._
+
+> ⚠️ **7-Zip** and **Notepad++** are also in the installed-apps list — they're legitimate. Removing either
+> is −10. _(Relates to **Unwanted Software** — leave these two installed; only Wireshark, Nmap, and
+> TeamViewer are prohibited.)_
+
+## Final sweep
 
 - Recon again: only authorized users remain; Administrators has no boromir/svc_winrm; Event Log Readers has
   no merry; Remote Management Users has no pippin/mordoragent.
@@ -136,5 +188,6 @@ Get-SmbShareAccess -Name CompanyData                 # no 'Everyone / Allow' ent
   sentinel and Everyone is gone; `Get-Service Spooler` → Disabled.
 - Confirm 7-Zip and Notepad++ are still installed (didn't earn a penalty).
 
-That's 33 hardening checks + 2 forensics, 2 penalties to avoid. Work top-down: recon, accounts/groups,
-policy, registry, software/files — and the services last so you can verify they still work.
+That's 33 hardening checks + 2 forensics, 2 penalties to avoid. Work down the categories above: answer
+Forensics first, then Account Management through the software categories — and the services last so you can
+verify they still work.

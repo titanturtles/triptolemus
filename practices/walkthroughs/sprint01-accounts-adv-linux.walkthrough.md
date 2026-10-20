@@ -11,9 +11,31 @@ authorized user costs points**.
 
 Work as your admin account; prefix privileged commands with `sudo`. Open a terminal.
 
+**How CyberPatriot scores this image.** The scoring report groups findings by **vulnerability
+category**. This image touches them, in order: **Forensics Questions**, **Account Management**,
+**Account & Password Policy**, **Local Policies**, **Defensive Countermeasures**, **Uncategorized
+Operating System Settings**, **Operating System & Application Updates**, **Service Auditing**,
+**Malware**, **Unwanted Software**, and **Prohibited Files** — plus **Penalties** for actions that
+lose points. Answer the **Forensics** questions first, before you change anything, because a fix can
+destroy the evidence you need; then work down the categories.
+
 ---
 
-## 0. Recon first (look before you touch)
+## Forensics Questions
+
+Read and answer these BEFORE changing anything — a change you make may destroy the evidence. Answer in
+the agent's "Forensics…" panel.
+
+- **Who kept the disguised diary?** The file lived under `/home/winston/…`, so → **winston**.
+- **Attacker's source IP (brute force)?** `grep 'Failed password' /var/log/auth.log` → repeated
+  failures *from* **172.16.164.1**.
+- **Decode the cipher calculator log on winston's Desktop.** `cat ~winston/Desktop/calclog.txt` shows
+  the alphametic `RED + RED + QUARK = STORK`. Each of the 10 distinct letters stands for a distinct
+  digit; solving and reading the digits out gives **1984735260**.
+
+## Account Management
+
+Recon first — look before you touch:
 
 ```bash
 # who exists, and who has dangerous power
@@ -25,8 +47,6 @@ getent group suspects                 # who's in the suspects group
 
 You'll notice three users who aren't on the authorized list — **aaronson**, **goldstein**, and a
 second account with **UID 0** (that's the big one: a non-root account with UID 0 is a root impostor).
-
-## 1. Accounts & groups
 
 ```bash
 sudo userdel -r aaronson            # unauthorized
@@ -42,10 +62,7 @@ sudo gpasswd -r root
 grep '^root:' /etc/gshadow           # should now be  root:!::  (or empty), not a hash
 ```
 
-> ⚠️ Do **not** delete winston or charrington (−10 each). They're authorized. julia stays too — you
-> only strip her admin rights.
-
-## 2. Password & account policy
+## Account & Password Policy
 
 ```bash
 sudo sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t7/' /etc/login.defs   # a minimum password age (≥1)
@@ -53,7 +70,19 @@ sudo usermod -L root                                                 # lock the 
 passwd -S root                                                       # shows 'L' = locked
 ```
 
-## 3. Kernel hardening (sysctl)
+## Local Policies
+
+```bash
+sudo systemctl enable --now auditd   # audit daemon running
+```
+
+## Defensive Countermeasures
+
+```bash
+sudo ufw enable                      # firewall on
+```
+
+## Uncategorized Operating System Settings
 
 The image shipped with several kernel protections turned off. Set them in one drop-in and apply:
 ```bash
@@ -69,23 +98,38 @@ sudo sysctl --system
 ```
 Spot-check: `sysctl kernel.randomize_va_space` → `= 2`.
 
-## 4. Firewall & auditing
+## Operating System & Application Updates
 
 ```bash
-sudo ufw enable                      # firewall on
-sudo systemctl enable --now auditd   # audit daemon running
+sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
 ```
 
-## 5. Prohibited software & files
+## Service Auditing
 
+**SSH.** It's stopped and wide open. Harden it with a drop-in (which overrides the main config), then
+start it. winston's key is already installed, so his login keeps working.
 ```bash
-sudo apt-get purge -y john           # password cracker — not allowed
-# winston's "diary" is disguised as a Mint welcome flag; read it (forensics!) then remove it
-cat /home/winston/.linuxmint/mintwelcome/norun.flag
-sudo rm /home/winston/.linuxmint/mintwelcome/norun.flag
+printf 'PermitRootLogin no\nPermitEmptyPasswords no\n' | sudo tee /etc/ssh/sshd_config.d/99-hardening.conf
+sudo systemctl enable --now ssh
+sudo sshd -T | grep -E 'permitrootlogin|permitemptypasswords'   # both -> no
 ```
 
-## 6. Persistence — hunt the attacker's footholds
+**Internal web page (port 8099).** The `ptweb` service is stopped and, worse, set to listen on every
+interface. It must run but be reachable only from localhost.
+```bash
+sudo sed -i 's/--bind 0.0.0.0/--bind 127.0.0.1/' /etc/systemd/system/ptweb.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ptweb
+curl http://127.0.0.1:8099/sentinel.txt     # -> PT-WEB-OK-5B2C
+ss -ltn | grep 8099                          # 127.0.0.1:8099, NOT 0.0.0.0:8099
+```
+
+## Malware
+
+Hunt the attacker's footholds.
 
 ```bash
 # scheduled callbacks
@@ -109,50 +153,33 @@ getfacl /usr/bin/sudo                 # note the extra user entry
 sudo setfacl -b /usr/bin/sudo         # strip all ACLs back to normal
 ```
 
-## 7. Updates
+## Unwanted Software
 
 ```bash
-sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
+sudo apt-get purge -y john           # password cracker — not allowed
 ```
 
-## 8. Bring the two services back — working AND secured
+## Prohibited Files
 
-**SSH.** It's stopped and wide open. Harden it with a drop-in (which overrides the main config), then
-start it. winston's key is already installed, so his login keeps working.
 ```bash
-printf 'PermitRootLogin no\nPermitEmptyPasswords no\n' | sudo tee /etc/ssh/sshd_config.d/99-hardening.conf
-sudo systemctl enable --now ssh
-sudo sshd -T | grep -E 'permitrootlogin|permitemptypasswords'   # both -> no
+# winston's "diary" is disguised as a Mint welcome flag; read it (forensics!) then remove it
+cat /home/winston/.linuxmint/mintwelcome/norun.flag
+sudo rm /home/winston/.linuxmint/mintwelcome/norun.flag
 ```
 
-**Internal web page (port 8099).** The `ptweb` service is stopped and, worse, set to listen on every
-interface. It must run but be reachable only from localhost.
-```bash
-sudo sed -i 's/--bind 0.0.0.0/--bind 127.0.0.1/' /etc/systemd/system/ptweb.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now ptweb
-curl http://127.0.0.1:8099/sentinel.txt     # -> PT-WEB-OK-5B2C
-ss -ltn | grep 8099                          # 127.0.0.1:8099, NOT 0.0.0.0:8099
-```
+## Penalties
 
-## 9. Forensics (answer in the agent's "Forensics…" panel)
+> ⚠️ Do **not** delete winston or charrington (−10 each). They're authorized. julia stays too — you
+> only strip her admin rights.
 
-- **Who kept the disguised diary?** The file lived under `/home/winston/…`, so → **winston**.
-- **Attacker's source IP (brute force)?** `grep 'Failed password' /var/log/auth.log` → repeated
-  failures *from* **172.16.164.1**.
-- **Decode the cipher calculator log on winston's Desktop.** `cat ~winston/Desktop/calclog.txt` shows
-  the alphametic `RED + RED + QUARK = STORK`. Each of the 10 distinct letters stands for a distinct
-  digit; solving and reading the digits out gives **1984735260**.
+## Final sweep
 
-## 10. Final sweep
-
-- Re-run the recon from step 0: only `root` has UID 0; only authorized users remain; julia isn't in
-  `sudo`; winston is in `suspects`.
+- Re-run the recon from the Account Management section: only `root` has UID 0; only authorized users
+  remain; julia isn't in `sudo`; winston is in `suspects`.
 - `systemctl is-active auditd ssh ptweb` → all `active`; `ufw status` → active.
 - Confirm you did **not** delete winston or charrington.
 
-That's the full 34 checks. In a real round, work top-down like this — recon, then accounts/policy, then
-kernel/firewall, then hunt persistence, and leave the services for last so you can verify they still work.
+That's the full 34 checks. In a real round, work top-down by category like this — answer Forensics
+first, clean up Account Management and policy, bring up the local/defensive and OS settings and
+updates, restore and secure the services, then hunt down the malware, unwanted software, and
+prohibited files — verifying the two services still work before you finish.
